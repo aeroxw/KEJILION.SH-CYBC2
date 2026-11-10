@@ -2321,9 +2321,12 @@ c2_docker_network_quirks_apply() {
 	[ "$need_raw" = "1" ] || [ "$need_no6" = "1" ] || return 0
 	[ -f "$conf" ] || return 0
 	jq empty "$conf" >/dev/null 2>&1 || return 0
+	# 注意：jq 的键名含连字符时必须用方括号写法。
+	# .allow-direct-routing 会被解析成「.allow - direct - routing」，
+	# jq 直接以退出码 3 失败且不输出任何内容。
 	local filter='.'
-	[ "$need_raw" = "1" ] && filter="$filter | .allow-direct-routing = true"
-	[ "$need_no6" = "1" ] && filter="$filter | .ip6tables = false"
+	[ "$need_raw" = "1" ] && filter="$filter | .[\"allow-direct-routing\"] = true"
+	[ "$need_no6" = "1" ] && filter="$filter | .[\"ip6tables\"] = false"
 	jq "$filter" "$conf" > "${conf}.tmp" 2>/dev/null || { rm -f -- "${conf}.tmp"; return 1; }
 	mv -f -- "${conf}.tmp" "$conf" 2>/dev/null || { rm -f -- "${conf}.tmp"; return 1; }
 	[ "$need_raw" = "1" ] && echo -e "${gl_huang}检测到内核不支持 iptables raw 表，已开启 allow-direct-routing${gl_bai}"
