@@ -2602,6 +2602,11 @@ c2_status() {
 	else
 		echo -e "模式: ${gl_hui}未启用（软件安装在系统盘）${gl_bai}"
 	fi
+	if [ -x /usr/local/sbin/c2-guard ]; then
+		echo "定制守护: 已安装（防第三方应用覆盖 C2 定制）"
+	else
+		echo -e "定制守护: ${gl_huang}未安装（KPanel 等应用安装后可能覆盖本脚本）${gl_bai}"
+	fi
 	echo "------------------------------------------------"
 }
 
@@ -2618,6 +2623,7 @@ c2_menu() {
 		echo -e "${gl_kjlan}5.   ${gl_bai}查看 SSD 候选挂载点"
 		echo -e "${gl_kjlan}6.   ${gl_bai}环境自检（系统 / 组件 / 磁盘）"
 		echo -e "${gl_kjlan}7.   ${gl_bai}补齐基础组件（bash/curl/jq 等）"
+		echo -e "${gl_kjlan}8.   ${gl_bai}安装 / 检查 C2 定制守护（防 KPanel 覆盖）"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级选单"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -2662,6 +2668,102 @@ c2_menu() {
 				clear
 				c2_ensure_deps
 				echo ""
+				;;
+			8)
+				clear
+				c2_guard_menu
+				echo ""
+				;;
+			*)
+				break
+				;;
+		esac
+		read -e -p "按回车键继续..." _c2_ignore
+	done
+}
+
+# C2: 定制守护脚本的候选下载地址（Fork 内的 c2_guard.sh）
+c2_guard_urls() {
+	printf '%s\n' \
+		"https://raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/c2_guard.sh" \
+		"https://ghproxy.net/https://raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/c2_guard.sh" \
+		"https://gh.kejilion.pro/raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/c2_guard.sh"
+}
+
+# C2: 下载并安装守护脚本
+c2_guard_install() {
+	local url tmp
+	mkdir -p /usr/local/sbin 2>/dev/null
+	tmp="/usr/local/sbin/c2_guard.sh.download.$$"
+	for url in $(c2_guard_urls); do
+		if curl -fsSL --connect-timeout 15 --max-time 120 -o "$tmp" "$url" 2>/dev/null ||
+			wget -q -T 30 -O "$tmp" "$url" 2>/dev/null; then
+			if grep -q 'C2_GUARD_LIB_ONLY' "$tmp" 2>/dev/null && bash -n "$tmp" 2>/dev/null; then
+				mv -f "$tmp" /usr/local/sbin/c2-guard 2>/dev/null
+				chmod 0755 /usr/local/sbin/c2-guard 2>/dev/null
+				sh /usr/local/sbin/c2-guard install
+				return 0
+			fi
+		fi
+		rm -f "$tmp" 2>/dev/null
+	done
+	echo -e "${gl_hong}守护脚本下载失败，请检查网络后重试。${gl_bai}"
+	return 1
+}
+
+# C2: 守护状态
+c2_guard_status() {
+	if [ -x /usr/local/sbin/c2-guard ]; then
+		sh /usr/local/sbin/c2-guard status
+	else
+		echo -e "${gl_huang}尚未安装 C2 定制守护${gl_bai}"
+	fi
+}
+
+# C2: 守护菜单
+c2_guard_menu() {
+	local sub
+	while true; do
+		clear
+		echo -e "${gl_kjlan}C2 定制守护${gl_bai}"
+		echo "------------------------------------------------"
+		echo "用途：KPanel 等第三方应用安装时会把上游版本的 kejilion.sh 覆盖到"
+		echo "      /usr/local/bin/k，而上游脚本会用 cat > 重写 daemon.json，"
+		echo "      从而抹掉 SSD 存储与容器网络必需的配置。"
+		echo "守护负责：被覆盖时自动恢复 C2 版脚本，并修复 daemon.json / containerd / 软链。"
+		echo ""
+		echo -e "${gl_kjlan}1.   ${gl_bai}安装并启用守护（定时器 + 路径监视）"
+		echo -e "${gl_kjlan}2.   ${gl_bai}查看守护状态"
+		echo -e "${gl_kjlan}3.   ${gl_bai}立即执行一次校验修复"
+		echo -e "${gl_kjlan}4.   ${gl_bai}停用并移除守护"
+		echo -e "${gl_kjlan}------------------------${gl_bai}"
+		echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级选单"
+		echo -e "${gl_kjlan}------------------------${gl_bai}"
+		read -e -p "请输入你的选择: " sub
+		case $sub in
+			1)
+				clear
+				c2_guard_install
+				;;
+			2)
+				clear
+				c2_guard_status
+				;;
+			3)
+				clear
+				if [ -x /usr/local/sbin/c2-guard ]; then
+					sh /usr/local/sbin/c2-guard check
+				else
+					echo -e "${gl_huang}尚未安装 C2 定制守护${gl_bai}"
+				fi
+				;;
+			4)
+				clear
+				if [ -x /usr/local/sbin/c2-guard ]; then
+					sh /usr/local/sbin/c2-guard uninstall
+				else
+					echo -e "${gl_huang}尚未安装 C2 定制守护${gl_bai}"
+				fi
 				;;
 			*)
 				break
