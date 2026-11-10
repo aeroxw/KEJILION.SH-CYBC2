@@ -1886,9 +1886,8 @@ c2_is_mounted() {
 }
 
 # 判断源设备是否为固态硬盘(非旋转)
-c2_dev_is_ssd() {
-	local src="${1:-}" base cand
-	base="${src##*/}"
+c2_rotate_probe() {
+	local base="${1:-}" cand slaves slave rc
 	[ -n "$base" ] || return 2
 	for cand in "$base" "${base%p[0-9]}" "${base%%[0-9]*}"; do
 		if [ -e "/sys/block/$cand/queue/rotational" ]; then
@@ -1898,7 +1897,22 @@ c2_dev_is_ssd() {
 			return 1
 		fi
 	done
+	# 设备映射(LVM)、RAID 等：沿 slaves 向下找物理盘
+	slaves=$(ls "/sys/class/block/$base/slaves/" 2>/dev/null)
+	for slave in $slaves; do
+		c2_rotate_probe "$slave"
+		rc=$?
+		[ "$rc" -eq 0 ] && return 0
+		[ "$rc" -eq 1 ] && return 1
+	done
 	return 2
+}
+
+c2_dev_is_ssd() {
+	local src="${1:-}" base
+	base="${src##*/}"
+	[ -n "$base" ] || return 2
+	c2_rotate_probe "$base"
 }
 
 # 统一取容量：兼容 GNU df 与 busybox df
