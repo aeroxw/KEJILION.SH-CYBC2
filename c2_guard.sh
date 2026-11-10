@@ -139,7 +139,6 @@ download_script() {
 	_dest="${1:-}"
 	[ -n "$_dest" ] || return 1
 	_tmp="$_dest.download.$$"
-	_url
 	for _url in $C2_SCRIPT_URLS; do
 		rm -f "$_tmp" 2>/dev/null
 		if have_cmd curl; then
@@ -480,8 +479,29 @@ do_check() {
 # systemd 单元
 # ---------------------------------------------------------------------------
 
+# 建立 SSD 上的权威副本（优先复制本机现有 C2 版脚本，其次下载）
+# 已存在时同样刷新，保证权威副本与当前安装版本一致
+seed_canonical() {
+	_canon=$(canonical_path)
+	_mkdir=$(dirname "$_canon")
+	[ -d "$_mkdir" ] || mkdir -p "$_mkdir" 2>/dev/null || return 1
+	for _src in "$C2_GUARD_SCRIPT_PATH" "$C2_GUARD_ROOT_SCRIPT"; do
+		if script_is_c2 "$_src"; then
+			cp -f "$_src" "$_canon" 2>/dev/null || continue
+			chmod 0755 "$_canon" 2>/dev/null
+			log "已用本机 C2 版脚本刷新权威副本: $_canon"
+			return 0
+		fi
+	done
+	# 本机没有可用副本时退回下载
+	ensure_canonical >/dev/null 2>&1
+}
+
 install_units() {
 	have_cmd systemctl || { err "未检测到 systemd，无法安装守护单元"; return 1; }
+
+	# 先把权威副本落到 SSD 上，之后即使断网也能恢复
+	seed_canonical
 
 	cat > "$C2_GUARD_UNIT_DIR/c2-guard.service" << EOF
 [Unit]

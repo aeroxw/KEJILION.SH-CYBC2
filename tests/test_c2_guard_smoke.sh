@@ -27,6 +27,14 @@ if command -v dash >/dev/null 2>&1; then
 fi
 bash -n "$guard_path" || fail "c2_guard.sh failed bash syntax check"
 
+# 孤立的下划线变量行会被 shell 当成命令执行（_url: not found），
+# 这类行必须是变量赋值形式
+if grep -nE '^[[:space:]]+_[a-zA-Z_]+[[:space:]]*$' "$guard_path" >/dev/null; then
+	echo "FAIL: c2_guard.sh contains standalone variable lines" >&2
+	grep -nE '^[[:space:]]+_[a-zA-Z_]+[[:space:]]*$' "$guard_path" >&2
+	exit 1
+fi
+
 # --- 2. 准备夹具 -------------------------------------------------------------
 sandbox="$test_root/sandbox"
 mkdir -p "$sandbox/bin" "$sandbox/root" "$sandbox/storage/c2" "$sandbox/storage/docker" "$sandbox/storage/web" "$sandbox/home"
