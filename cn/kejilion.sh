@@ -1900,6 +1900,274 @@ c2_dev_is_ssd() {
 	return 2
 }
 
+# 统一取容量：兼容 GNU df 与 busybox df
+# GNU df 在设备名过长时会把设备名折行，直接取 NR==2 会解析错列
+# 输出两列：总容量(KB) 与 可用容量(KB)
+c2_df_kb() {
+	local path="${1:-}" out
+	[ -n "$path" ] || return 1
+	out=$(df -k -- "$path" 2>/dev/null) || out=$(df -k "$path" 2>/dev/null) || return 1
+	printf '%s\n' "$out" | awk '
+		NF >= 6 && $2 ~ /^[0-9]+$/ { tb = $2; ab = $4 }
+		NF == 5 && $1 ~ /^[0-9]+$/ { tb = $1; ab = $3 }
+		END { if (tb > 0) printf "%.0f\t%.0f\n", tb, ab }
+	'
+}
+
+c2_kb_to_human() {
+	printf '%s' "${1:-}" | awk -F'\t' '
+		{
+			v = $1 / 1048576
+			if (v >= 1024) printf "%.1fG", v / 1024
+			else printf "%.0fM", v
+		}
+	'
+}
+
+# 挂载点总容量
+c2_df_size() {
+	local vals
+	vals=$(c2_df_kb "${1:-}") || return 1
+	[ -n "$vals" ] || return 1
+	c2_kb_to_human "$(printf '%s' "$vals" | cut -f1)"
+}
+
+# 挂载点可用容量
+c2_df_avail() {
+	local vals
+	vals=$(c2_df_kb "${1:-}") || return 1
+	[ -n "$vals" ] || return 1
+	c2_kb_to_human "$(printf '%s' "$vals" | cut -f2)"
+}
+
+# 块设备容量（读 /sys/block/<name>/size，单位为 512 字节扇区）
+c2_block_size_human() {
+	local name="${1:-}" sectors gb
+	[ -n "$name" ] || return 1
+	sectors=$(cat "/sys/block/$name/size" 2>/dev/null)
+	[ -n "$sectors" ] || return 1
+	gb=$((sectors / 2097152))
+	if [ "$gb" -gt 0 ]; then
+		printf '%sG' "$gb"
+	else
+		printf '%sM' "$((sectors * 512 / 1048576))"
+	fi
+}
+
+# 判断路径是否落在内存盘（tmpfs/ramfs）上
+# 云存宝 C2 的 /tmp 与 /var 都在内存盘上，镜像与构建产物放这里会直接吃内存
+c2_is_ramfs() {
+	local path="${1:-}" dev mp fstype
+	[ -n "$path" ] || return 1
+	path="${path%/}"
+	[ -n "$path" ] || path="/"
+	while read -r dev mp fstype _rest; do
+		if [ "$mp" = "$path" ]; then
+			case "$fstype" in
+				tmpfs|ramfs) return 0 ;;
+			esac
+			return 1
+		fi
+	done < /proc/mounts
+	return 1
+}
+
+# Docker 守护进程是否在运行
+c2_docker_running() {
+	if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+		return 0
+	fi
+	if command -v pidof >/dev/null 2>&1 && pidof dockerd >/dev/null 2>&1; then
+		return 0
+	fi
+	return 1
+}
+
+# 裸 dockerd（未被 init 托管）时停止守护进程
+c2_dockerd_stop() {
+	local pid i=0
+	command -v pidof >/dev/null 2>&1 || return 1
+	pid=$(pidof dockerd 2>/dev/null | awk '{print $1}')
+	[ -n "$pid" ] || return 1
+	kill "$pid" 2>/dev/null || return 1
+	while [ "$i" -lt 15 ]; do
+		pidof dockerd >/dev/null 2>&1 || return 0
+		i=$((i + 1))
+		sleep 1
+	done
+	kill -9 "$pid" 2>/dev/null
+	return 0
+}
+
+# 裸 dockerd（未被 init 托管）时拉起守护进程
+c2_dockerd_start() {
+	command -v dockerd >/dev/null 2>&1 || return 1
+	# 已有 init 脚本时交给服务管理器处理，避免出现两个 dockerd
+	if [ -x /etc/init.d/docker ] || [ -x /etc/init.d/dockerd ]; then
+		return 1
+	fi
+	mkdir -p /var/log 2>/dev/null
+	nohup dockerd >/var/log/dockerd-kejilion.log 2>&1 &
+	sleep 3
+	c2_docker_running
+}
+
+# Docker 服务启停：兼容 systemd / rc.service / service / init.d / 裸 dockerd
+c2_service_action() {
+	local action="${1:-}" name="${2:-docker}"
+	case "$action" in
+		start|stop|restart|reload) ;;
+		*) return 1 ;;
+	esac
+	[ -n "$name" ] || return 1
+	if kj_service_action "$action" "$name"; then
+		return 0
+	fi
+	# OpenWrt 的 dockerd 包服务名通常是 dockerd
+	if [ "$name" = "docker" ] && kj_service_action "$action" "dockerd"; then
+		return 0
+	fi
+	if [ "$action" = "stop" ] || [ "$action" = "restart" ]; then
+		c2_dockerd_stop && return 0
+	fi
+	if [ "$action" = "start" ] || [ "$action" = "restart" ]; then
+		c2_dockerd_start && return 0
+	fi
+	return 1
+}
+
+# 列出块设备（已挂载 / 未挂载），用于确认 SSD 是否就绪
+c2_list_disks() {
+	local dev mp fstype dev_base size
+	echo "已挂载的块设备:"
+	while read -r dev mp fstype _rest; do
+		case "$fstype" in
+			tmpfs|devtmpfs|proc|sysfs|cgroup|cgroup2|overlay|squashfs|ramfs|efivarfs|debugfs|tracefs|securityfs|mqueue|hugetlbfs|configfs|pstore|bpf|binfmt_misc|nsfs|autofs|rootfs|udf|iso9660) continue ;;
+		esac
+		dev_base="${dev##*/}"
+		case "$dev_base" in
+			loop*|ram*|zram*|dm-*) continue ;;
+		esac
+		size=$(c2_df_size "$mp")
+		if c2_dev_is_ssd "$dev"; then
+			echo "  $mp  设备=$dev  容量=${size:-未知}  类型=SSD"
+		else
+			echo "  $mp  设备=$dev  容量=${size:-未知}  类型=HDD/其它"
+		fi
+	done < /proc/mounts
+	echo "未挂载的块设备:"
+	for dev in /dev/sd? /dev/nvme?n? /dev/mmcblk?; do
+		[ -b "$dev" ] || continue
+		dev_base="${dev##*/}"
+		if awk -v d="$dev" '$1==d || index($1, d)==1 {found=1} END{exit found?0:1}' /proc/mounts 2>/dev/null; then
+			continue
+		fi
+		size=$(c2_block_size_human "$dev_base")
+		if [ -n "$size" ]; then
+			echo "  $dev  容量=$size  (尚未挂载，需先格式化并挂载)"
+		else
+			echo "  $dev  (尚未挂载，需先格式化并挂载)"
+		fi
+	done
+}
+
+# 把临时目录指向 SSD（OpenWrt 的 /tmp 是内存盘）
+c2_profile_tmpdir() {
+	local tmpdir="${1:-}" profile="/etc/profile"
+	[ -n "$tmpdir" ] || return 1
+	mkdir -p -- "$tmpdir" 2>/dev/null || return 1
+	mkdir -p /etc/profile.d 2>/dev/null
+	if [ -d /etc/profile.d ]; then
+		cat > /etc/profile.d/99kejilion-c2-storage.sh << EOF
+# 云存宝C2: 临时目录指向 SSD，避免 /tmp 内存盘被撑爆
+export TMPDIR="$tmpdir"
+EOF
+		chmod 0644 /etc/profile.d/99kejilion-c2-storage.sh 2>/dev/null
+	fi
+	# 部分 OpenWrt 的 /etc/profile 不会加载 profile.d，这里再补一段
+	if [ -f "$profile" ] && ! grep -q 'kejilion-c2-storage' "$profile" 2>/dev/null; then
+		{
+			echo ""
+			echo "# kejilion-c2-storage: 临时目录指向 SSD"
+			echo "[ -d \"$tmpdir\" ] && export TMPDIR=\"$tmpdir\""
+		} >> "$profile" 2>/dev/null
+	fi
+	return 0
+}
+
+# 环境自检：识别系统类型、缺失组件与磁盘状态
+c2_env_check() {
+	local pm="" c tmp_path
+	echo -e "${gl_kjlan}云存宝C2 环境自检${gl_bai}"
+	echo "------------------------------------------------"
+	if [ -f /etc/openwrt_release ]; then
+		echo "系统: OpenWrt ($(tr '\n' ' ' < /etc/openwrt_release | cut -c1-70))"
+		echo -e "      ${gl_huang}OpenWrt 默认没有 bash 与 Docker，需要先补齐基础组件${gl_bai}"
+	elif [ -f /etc/os-release ]; then
+		echo "系统: $(grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2)"
+	else
+		echo "系统: $(uname -srm)"
+	fi
+	echo "架构: $(uname -m)"
+	if [ -n "${BASH_VERSION:-}" ]; then
+		echo "Shell: bash ${BASH_VERSION}"
+	else
+		echo -e "Shell: ${gl_huang}非 bash（脚本依赖 bash）${gl_bai}"
+	fi
+	for pm in apt dnf yum apk pacman zypper opkg; do
+		if command -v "$pm" >/dev/null 2>&1; then
+			echo "包管理器: $pm"
+			break
+		fi
+	done
+	for c in curl git jq tar unzip docker dockerd; do
+		if command -v "$c" >/dev/null 2>&1; then
+			echo "组件: $c  已安装"
+		else
+			echo -e "组件: $c  ${gl_huang}缺失${gl_bai}"
+		fi
+	done
+	for tmp_path in /tmp /var; do
+		if c2_is_ramfs "$tmp_path"; then
+			echo -e "注意: $tmp_path 位于内存盘(tmpfs)上，大文件请放到 SSD${gl_bai}"
+		fi
+	done
+	echo "---- 磁盘 ----"
+	c2_list_disks
+	echo "------------------------------------------------"
+}
+
+# 补齐基础组件（OpenWrt 上 bash/curl/jq 等默认缺失）
+c2_ensure_deps() {
+	local missing="" pkg answer
+	for pkg in bash curl git jq tar unzip; do
+		command -v "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+	done
+	if [ -z "$missing" ]; then
+		echo -e "${gl_lv}基础组件齐全，无需安装${gl_bai}"
+		return 0
+	fi
+	echo -e "${gl_huang}以下基础组件缺失:$missing${gl_bai}"
+	if [ -f /etc/openwrt_release ]; then
+		echo "OpenWrt 需要先配置可用的 opkg 软件源，否则安装会失败。"
+		echo "厂商固件通常不带通用源，请确认 /etc/opkg/distfeeds.conf 可用后再继续。"
+	fi
+	read -e -p "是否尝试安装？(y/n): " answer
+	case "$answer" in
+		y|Y|yes|YES) ;;
+		*) echo "已取消"; return 1 ;;
+	esac
+	if command -v opkg >/dev/null 2>&1; then
+		opkg update && opkg install $missing
+	elif command -v apt >/dev/null 2>&1; then
+		apt update -y && apt install -y $missing
+	elif command -v apk >/dev/null 2>&1; then
+		apk update && apk add $missing
+	else
+		install $missing
+	fi
+}
+
 # 列出可作为 SSD 存储的候选挂载点
 c2_detect_candidates() {
 	local dev mp fstype size kind
@@ -1909,7 +2177,7 @@ c2_detect_candidates() {
 		esac
 		[ "$mp" = "/" ] && continue
 		[ -d "$mp" ] || continue
-		size=$(df -h -- "$mp" 2>/dev/null | awk 'NR==2 {print $2}')
+		size=$(c2_df_size "$mp")
 		[ -n "$size" ] || continue
 		if c2_dev_is_ssd "$dev"; then kind="SSD"; else kind="HDD"; fi
 		printf '%s\t%s\t%s\t%s\n' "$mp" "$dev" "$size" "$kind"
@@ -2017,15 +2285,24 @@ c2_setup_cache() {
 	local root="${1:-}" cache
 	[ -n "$root" ] || return 1
 	cache=$(c2_path_cache "$root")
-	mkdir -p -- "$cache/apt/archives/partial" "$cache/npm" "$cache/pip" "$cache/tmp" "$(c2_path_backup "$root")" 2>/dev/null || return 1
+	mkdir -p -- "$cache/apt/archives/partial" "$cache/npm" "$cache/pip" "$cache/opkg" "$cache/tmp" "$(c2_path_backup "$root")" 2>/dev/null || return 1
 	if [ -d /etc/apt/apt.conf.d ]; then
 		cat > /etc/apt/apt.conf.d/99kejilion-c2-storage.conf << EOF
 Dir::Cache "$cache/apt/";
 Dir::Cache::archives "$cache/apt/archives/";
 EOF
 	fi
+	# opkg（OpenWrt / 嵌入式设备）：包下载缓存默认落在内存盘，重定向到 SSD
+	if command -v opkg >/dev/null 2>&1; then
+		if [ -d /var/cache/opkg ] && [ ! -L /var/cache/opkg ]; then
+			c2_migrate_dir /var/cache/opkg "$cache/opkg" >/dev/null 2>&1
+			c2_symlink /var/cache/opkg "$cache/opkg" >/dev/null 2>&1
+		fi
+	fi
 	command -v npm >/dev/null 2>&1 && npm config set cache "$cache/npm" >/dev/null 2>&1
 	command -v pip3 >/dev/null 2>&1 && pip3 config set global.cache-dir "$cache/pip" >/dev/null 2>&1
+	# 临时目录指向 SSD（OpenWrt 的 /tmp 是内存盘）
+	c2_profile_tmpdir "$cache/tmp" >/dev/null 2>&1
 	return 0
 }
 
@@ -2063,13 +2340,11 @@ c2_apply() {
 	data_target=$(c2_path_docker_data "$root")
 	mkdir -p -- "$docker_target" "$web_target" "$data_target" 2>/dev/null || { echo "无法创建子目录"; return 1; }
 
-	if command -v docker >/dev/null 2>&1; then
-		if docker info >/dev/null 2>&1; then was_running=1; fi
-	fi
+	if c2_docker_running; then was_running=1; fi
 	if [ "$was_running" = "1" ]; then
 		echo "正在停止 Docker 以便安全迁移数据..."
-		docker stop $(docker ps -q) >/dev/null 2>&1
-		systemctl stop docker >/dev/null 2>&1 || service docker stop >/dev/null 2>&1
+		command -v docker >/dev/null 2>&1 && docker stop $(docker ps -q 2>/dev/null) >/dev/null 2>&1
+		c2_service_action stop docker
 	fi
 
 	echo "正在迁移 Docker 存储目录 (/var/lib/docker)..."
@@ -2095,7 +2370,7 @@ c2_apply() {
 
 	if [ "$was_running" = "1" ]; then
 		echo "正在启动 Docker..."
-		systemctl start docker >/dev/null 2>&1 || service docker start >/dev/null 2>&1
+		c2_service_action start docker
 	fi
 
 	echo -e "${gl_lv}软件安装目录已切换到 SSD: ${root}${gl_bai}"
@@ -2115,12 +2390,10 @@ c2_revert() {
 	web_target=$(c2_path_web "$root")
 	data_target=$(c2_path_docker_data "$root")
 
-	if command -v docker >/dev/null 2>&1; then
-		if docker info >/dev/null 2>&1; then was_running=1; fi
-	fi
+	if c2_docker_running; then was_running=1; fi
 	if [ "$was_running" = "1" ]; then
-		docker stop $(docker ps -q) >/dev/null 2>&1
-		systemctl stop docker >/dev/null 2>&1 || service docker stop >/dev/null 2>&1
+		command -v docker >/dev/null 2>&1 && docker stop $(docker ps -q 2>/dev/null) >/dev/null 2>&1
+		c2_service_action stop docker
 	fi
 
 	[ -L /home/docker ] && rm -f /home/docker
@@ -2140,7 +2413,7 @@ c2_revert() {
 	c2_conf_clear
 	rm -f /etc/apt/apt.conf.d/99kejilion-c2-storage.conf 2>/dev/null
 	if [ "$was_running" = "1" ]; then
-		systemctl start docker >/dev/null 2>&1 || service docker start >/dev/null 2>&1
+		c2_service_action start docker
 	fi
 	echo -e "${gl_lv}已恢复默认布局，软件数据回到系统盘${gl_bai}"
 	return 0
@@ -2148,19 +2421,28 @@ c2_revert() {
 
 # 显示当前存储状态
 c2_status() {
-	local root docker_target web_target data_target
+	local root docker_target web_target data_target item
 	c2_conf_load
 	echo -e "${gl_kjlan}云存宝C2 存储状态${gl_bai}"
 	echo "------------------------------------------------"
+	if [ -f /etc/openwrt_release ]; then
+		echo -e "系统: ${gl_huang}OpenWrt${gl_bai}"
+	fi
 	if [ "$C2_ENABLED" = "true" ] && [ -n "$C2_STORAGE_ROOT" ]; then
 		root="${C2_STORAGE_ROOT%/}"
 		echo -e "模式: ${gl_lv}已启用 SSD 存储${gl_bai}"
 		echo "存储根目录: $root"
+		if c2_on_system_disk "$root"; then
+			echo -e "${gl_huang}警告: 存储根目录仍在系统盘上，软件并没有真正装到 SSD${gl_bai}"
+		fi
+		if c2_is_ramfs "$root"; then
+			echo -e "${gl_huang}警告: 存储根目录位于内存盘(tmpfs)上，重启后会丢失${gl_bai}"
+		fi
 		docker_target=$(c2_path_docker "$root")
 		web_target=$(c2_path_web "$root")
 		data_target=$(c2_path_docker_data "$root")
 		for item in "$docker_target" "$web_target" "$data_target"; do
-			[ -d "$item" ] && echo "  $item  $(df -h -- "$item" 2>/dev/null | awk 'NR==2 {print $2" 可用 "$4}')"
+			[ -d "$item" ] && echo "  $item  $(c2_df_size "$item")  可用 $(c2_df_avail "$item")"
 		done
 		echo "/home/docker -> $(readlink -f /home/docker 2>/dev/null || echo '未链接')"
 		echo "/home/web    -> $(readlink -f /home/web 2>/dev/null || echo '未链接')"
@@ -2184,6 +2466,8 @@ c2_menu() {
 		echo -e "${gl_kjlan}3.   ${gl_bai}补齐迁移未迁移的数据到 SSD"
 		echo -e "${gl_kjlan}4.   ${gl_bai}恢复默认布局（搬回系统盘）"
 		echo -e "${gl_kjlan}5.   ${gl_bai}查看 SSD 候选挂载点"
+		echo -e "${gl_kjlan}6.   ${gl_bai}环境自检（系统 / 组件 / 磁盘）"
+		echo -e "${gl_kjlan}7.   ${gl_bai}补齐基础组件（bash/curl/jq 等）"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级选单"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -2217,6 +2501,16 @@ c2_menu() {
 				c2_detect_candidates | while IFS=$'\t' read -r mp dev size kind; do
 					echo "  $mp  设备=$dev  容量=$size  类型=$kind"
 				done
+				echo ""
+				;;
+			6)
+				clear
+				c2_env_check
+				echo ""
+				;;
+			7)
+				clear
+				c2_ensure_deps
 				echo ""
 				;;
 			*)
@@ -2462,9 +2756,32 @@ systemctl() {
 
 
 # 重启服务
+# 服务启停适配层：优先 systemd，缺失时依次回退 rc.service / service / init.d
+# 云存宝 C2 等 OpenWrt 设备没有 systemd，只有 rc.d 服务体系
+kj_service_action() {
+	local action="${1:-}" name="${2:-}"
+	case "$action" in
+		start|stop|restart|reload|status) ;;
+		*) return 1 ;;
+	esac
+	[ -n "$name" ] || return 1
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl "$action" "$name" >/dev/null 2>&1 && return 0
+	fi
+	if command -v rc-service >/dev/null 2>&1; then
+		rc-service "$name" "$action" >/dev/null 2>&1 && return 0
+	fi
+	if command -v service >/dev/null 2>&1; then
+		service "$name" "$action" >/dev/null 2>&1 && return 0
+	fi
+	if [ -x "/etc/init.d/$name" ]; then
+		"/etc/init.d/$name" "$action" >/dev/null 2>&1 && return 0
+	fi
+	return 1
+}
+
 restart() {
-	systemctl restart "$1"
-	if [ $? -eq 0 ]; then
+	if kj_service_action restart "$1"; then
 		echo "$1 服务已重启。"
 	else
 		echo "错误：重启 $1 服务失败。"
@@ -2473,8 +2790,7 @@ restart() {
 
 # 启动服务
 start() {
-	systemctl start "$1"
-	if [ $? -eq 0 ]; then
+	if kj_service_action start "$1"; then
 		echo "$1 服务已启动。"
 	else
 		echo "错误：启动 $1 服务失败。"
@@ -2483,8 +2799,7 @@ start() {
 
 # 停止服务
 stop() {
-	systemctl stop "$1"
-	if [ $? -eq 0 ]; then
+	if kj_service_action stop "$1"; then
 		echo "$1 服务已停止。"
 	else
 		echo "错误：停止 $1 服务失败。"
@@ -2493,9 +2808,21 @@ stop() {
 
 # 查看服务状态
 status() {
-	systemctl status "$1"
-	if [ $? -eq 0 ]; then
-		echo "$1 服务状态已显示。"
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl status "$1"
+		if [ $? -eq 0 ]; then
+			echo "$1 服务状态已显示。"
+		else
+			echo "错误：无法显示 $1 服务状态。"
+		fi
+		return
+	fi
+	if command -v rc-service >/dev/null 2>&1; then
+		rc-service "$1" status
+	elif command -v service >/dev/null 2>&1; then
+		service "$1" status
+	elif [ -x "/etc/init.d/$1" ]; then
+		"/etc/init.d/$1" status
 	else
 		echo "错误：无法显示 $1 服务状态。"
 	fi
@@ -2504,10 +2831,13 @@ status() {
 
 enable() {
 	local SERVICE_NAME="$1"
-	if command -v apk &>/dev/null; then
-		rc-update add "$SERVICE_NAME" default
+	if command -v apk &>/dev/null || command -v rc-update &>/dev/null; then
+		# Alpine / OpenWrt 等 rc.d 体系
+		rc-update add "$SERVICE_NAME" default >/dev/null 2>&1
+	elif command -v systemctl &>/dev/null; then
+		systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 	else
-	   /bin/systemctl enable "$SERVICE_NAME"
+	   /bin/systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 	fi
 
 	echo "$SERVICE_NAME 已设置为开机自启。"
