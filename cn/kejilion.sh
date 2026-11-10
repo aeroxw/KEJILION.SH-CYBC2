@@ -2698,15 +2698,42 @@ c2_auto_select() {
 
 
 if ! kpanel_protocol_active; then
-	canshu_v6
-	CheckFirstRun_true
-	yinsiyuanquan2
 	c2_conf_load
 
 	sed -i '/^alias k=/d' ~/.bashrc > /dev/null 2>&1
 	sed -i '/^alias k=/d' ~/.profile > /dev/null 2>&1
 	sed -i '/^alias k=/d' ~/.bash_profile > /dev/null 2>&1
-	cp -f ./kejilion.sh ~/kejilion.sh > /dev/null 2>&1
+
+	# 安装源取【脚本自身路径】，绝不取当前工作目录下的 ./kejilion.sh。
+	# 否则在任意目录里放一份旧 kejilion.sh 再执行 k，
+	# 旧副本就会覆盖已安装版本，C2 定制被静默回退。
+	c2_self_path="${BASH_SOURCE[0]:-$0}"
+	c2_install_src=""
+	c2_self_is_installed="no"
+	case "$c2_self_path" in
+		*kejilion.sh|*/k)
+			if [ -f "$c2_self_path" ]; then
+				if cmp -s "$c2_self_path" /usr/local/bin/k 2>/dev/null; then
+					# 运行的就是已安装的那份：以它为准回写 ~/kejilion.sh，保持两份一致
+					c2_install_src="/usr/local/bin/k"
+					c2_self_is_installed="yes"
+				else
+					# 是一份新副本：以它为准安装，稍后再从旧版本恢复用户设置
+					c2_install_src="$c2_self_path"
+				fi
+			fi
+			;;
+	esac
+	if [ -n "$c2_install_src" ]; then
+		cp -f "$c2_install_src" ~/kejilion.sh > /dev/null 2>&1
+	fi
+
+	# 设置恢复必须在安装之后执行：
+	# 这三个函数改写的是 ~/kejilion.sh，若先于 cp 执行会被覆盖掉
+	canshu_v6
+	CheckFirstRun_true
+	yinsiyuanquan2
+
 	cp -f ~/kejilion.sh /usr/local/bin/k > /dev/null 2>&1
 	ln -sf /usr/local/bin/k /usr/bin/k > /dev/null 2>&1
 fi

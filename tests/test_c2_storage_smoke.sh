@@ -204,5 +204,42 @@ if ! grep -Eq "jq --arg dr \"\\\$target\" '\\. \\+ '" "$script_path"; then
 	exit 1
 fi
 
+# ---------------------------------------------------------------- 自安装源回归
+# 安装源若取当前工作目录下的 ./kejilion.sh，
+# 用户在任意含旧副本的目录里执行 k 就会把已安装版本静默回退，
+# C2 定制（尤其是这些 assert 依赖的函数）会整体消失。
+if grep -Eq 'cp -f \./kejilion\.sh ~/' "$script_path"; then
+	echo "self-install copies from CWD-relative ./kejilion.sh" >&2
+	exit 1
+fi
+if ! grep -Eq 'BASH_SOURCE\[0\]' "$script_path"; then
+	echo "self-install does not use the script's own path" >&2
+	exit 1
+fi
+
+# 设置恢复必须在安装之后执行，否则恢复结果会被 cp 覆盖
+restore_line=$(grep -n 'canshu_v6' "$script_path" | grep -v '()' | head -1 | cut -d: -f1)
+install_line=$(grep -n 'cp -f "\$c2_install_src" ~/' "$script_path" | head -1 | cut -d: -f1)
+if [ -z "$restore_line" ] || [ -z "$install_line" ]; then
+	echo "cannot locate self-install / settings-restore blocks" >&2
+	exit 1
+fi
+if [ "$restore_line" -lt "$install_line" ]; then
+	echo "settings restore runs before install and gets overwritten" >&2
+	exit 1
+fi
+
+# ---------------------------------------------------------------- 设备名解析回归
+# LVM 挂载点在 /dev 下叫 vgdata-data，在 sysfs 里叫 dm-0。
+# 直接用 ##*/ 取名查不到 rotational，也找不到 slaves，会把 SSD 误判成 HDD。
+if ! grep -Eq 'c2_dev_kernel_name' "$script_path"; then
+	echo "device kernel name resolution (c2_dev_kernel_name) missing" >&2
+	exit 1
+fi
+if ! grep -Eq 'readlink -f -- "\$src"' "$script_path"; then
+	echo "device path is not resolved via readlink" >&2
+	exit 1
+fi
+
 echo "c2_storage_smoke=pass"
 
