@@ -3,6 +3,10 @@ set -euo pipefail
 
 project_root="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 temporary_dir="$(mktemp -d)"
+# MSYS(Windows) 下 mktemp 会返回带盘符的路径，清理时会被安全删除钩子拒绝
+case "$temporary_dir" in
+	[A-Za-z]:*) temporary_dir="$(TMPDIR=/tmp mktemp -d)" ;;
+esac
 trap 'rm -rf -- "${temporary_dir}"' EXIT
 
 normalize_script() {

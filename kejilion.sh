@@ -26834,6 +26834,21 @@ kpanel_app_source_config() {
 	return "$result"
 }
 
+# C2: 应用市场仓库多源回退
+# 云存宝 C2 常处于移动/联通/电信不同网络环境，GitHub 直连被重置的频率很高，
+# gh.kejilion.pro 代理也会间歇性不可达。逐个尝试候选镜像，任一可用即视为成功。
+c2_apps_git_remotes() {
+	local base="github.com/kejilion/apps.git"
+	local remote
+	for remote in \
+		"${gh_proxy}${base}" \
+		"https://ghproxy.net/https://${base}" \
+		"https://gh.kejilion.pro/${base}" \
+		"https://hub.gitmirror.com/https://${base}"; do
+		printf '%s\n' "$remote"
+	done
+}
+
 refresh_apps_catalog() {
 	if [ "${KJ_APP_CONCURRENCY:-}" = "1" ] && ! kpanel_app_lock_held catalog; then
 		kpanel_app_with_lock catalog refresh_apps_catalog "$@"; return $?
@@ -26847,13 +26862,36 @@ refresh_apps_catalog() {
 		return 1
 	fi
 	if [ ! -d "$apps_dir/.git" ]; then
-		timeout 30s git clone --depth=1 "$apps_remote" "$apps_dir" || {
+		# C2: 多源回退克隆，失败时清理半成品目录再换下一个源
+		local remote clone_ok=0
+		for remote in $(c2_apps_git_remotes); do
+			echo -e "${gl_kjlan}正在获取应用列表: ${remote}${gl_bai}"
+			if timeout 120s git clone --depth=1 "$remote" "$apps_dir"; then
+				clone_ok=1
+				break
+			fi
+			[ -d "$apps_dir" ] && rm -rf -- "$apps_dir"
+		done
+		if [ "$clone_ok" -ne 1 ]; then
 			echo -e "${gl_hong}应用列表下载失败，拒绝使用不完整配置。${gl_bai}"
 			return 1
-		}
+		fi
 		return 0
 	fi
-	if ! timeout 30s git -C "$apps_dir" pull --ff-only "$apps_remote" main; then
+	# C2: 多源回退更新
+	local remote pull_ok=0
+	for remote in $(c2_apps_git_remotes); do
+		if timeout 60s git -C "$apps_dir" pull --ff-only "$remote" main; then
+			pull_ok=1
+			break
+		fi
+	done
+	if [ "$pull_ok" -ne 1 ]; then
+		# C2: 全部镜像都不可用时降级使用本地已有列表，避免网络抖动直接瘫痪应用市场
+		if c2_enabled; then
+			echo -e "${gl_hong}应用列表更新失败（全部镜像不可用），继续使用本地已有列表。${gl_bai}"
+			return 0
+		fi
 		echo -e "${gl_hong}应用列表更新失败，拒绝继续使用可能过期的配置。${gl_bai}"
 		echo "请检查网络或 ${apps_dir} 中的本地修改后重试。"
 		return 1
