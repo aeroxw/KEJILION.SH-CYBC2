@@ -1867,6 +1867,7 @@ c2_root() {
 
 c2_path_docker() { printf '%s/docker' "${1:-}"; }
 c2_path_docker_data() { printf '%s/docker-data' "${1:-}"; }
+c2_path_containerd_data() { printf '%s/containerd-data' "${1:-}"; }
 c2_path_web() { printf '%s/web' "${1:-}"; }
 c2_path_cache() { printf '%s/cache' "${1:-}"; }
 c2_path_backup() { printf '%s/backup' "${1:-}"; }
@@ -2266,17 +2267,66 @@ c2_docker_data_root_apply() {
 	command -v jq >/dev/null 2>&1 || return 1
 	mkdir -p -- "$target" 2>/dev/null || return 1
 	mkdir -p -- "$(dirname -- "$conf")" 2>/dev/null
+	# systemd 环境下统一用 systemd cgroup driver，否则 cgroup v1 的 blkio 路径
+	# 缺失会让运行中的容器 healthcheck 失败（表现为 unhealthy）
+	local c2_extra='{"data-root": $dr}'
+	if [ -d /run/systemd/system ]; then
+		c2_extra='{"data-root": $dr, "exec-opts": ["native.cgroupdriver=systemd"]}'
+	fi
 	if [ -f "$conf" ] && [ -s "$conf" ]; then
 		if ! jq empty "$conf" >/dev/null 2>&1; then
 			cp -a -- "$conf" "${conf}.c2bak.$(date +%s)" 2>/dev/null
-			jq -n --arg dr "$target" '{"data-root": $dr}' > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
+			jq -n --arg dr "$target" "$c2_extra" > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
 		else
-			jq --arg dr "$target" '. + {"data-root": $dr}' "$conf" > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
+			jq --arg dr "$target" "$c2_extra" "$conf" > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
 		fi
 	else
-		jq -n --arg dr "$target" '{"data-root": $dr}' > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
+		jq -n --arg dr "$target" "$c2_extra" > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
 	fi
 	mv -f -- "${conf}.tmp" "$conf" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
+	return 0
+}
+
+# Docker 29 起默认启用 containerd image store，镜像层实际存放在 /var/lib/containerd，
+# 只迁移 /var/lib/docker 并不能把镜像搬走，必须同时迁移 containerd 的 root。
+# containerd 的 root 通过 /etc/containerd/config.toml 的 root 字段指定
+# （不用软链接：systemd 的 StateDirectory=containerd 会与软链接冲突）。
+C2_CONTAINERD_CONF="/etc/containerd/config.toml"
+
+# 读取 containerd 当前 root
+c2_containerd_root_current() {
+	local root=""
+	[ -f "$C2_CONTAINERD_CONF" ] || return 1
+	root=$(sed -n 's/^[[:space:]]*root[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p' "$C2_CONTAINERD_CONF" | head -n1)
+	[ -n "$root" ] || return 1
+	printf '%s' "$root"
+}
+
+# 设置 containerd root（保持配置格式，不整文件覆盖）
+c2_containerd_root_apply() {
+	local target="${1:-}" tmp
+	[ -n "$target" ] || return 1
+	mkdir -p -- "$target" 2>/dev/null || return 1
+	mkdir -p -- "$(dirname -- "$C2_CONTAINERD_CONF")" 2>/dev/null || return 1
+	if [ ! -f "$C2_CONTAINERD_CONF" ]; then
+		command -v containerd >/dev/null 2>&1 || return 1
+		containerd config default > "$C2_CONTAINERD_CONF" 2>/dev/null || return 1
+	fi
+	[ -s "$C2_CONTAINERD_CONF" ] || return 1
+	tmp="${C2_CONTAINERD_CONF}.c2tmp.$$"
+	if grep -qE '^[[:space:]]*root[[:space:]]*=' "$C2_CONTAINERD_CONF"; then
+		sed -i "s#^[[:space:]]*root[[:space:]]*=.*#root = \"$target\"#" "$C2_CONTAINERD_CONF" 2>/dev/null || return 1
+	else
+		sed -i "1i root = \"$target\"" "$C2_CONTAINERD_CONF" 2>/dev/null || return 1
+	fi
+	[ -s "$tmp" ] && rm -f -- "$tmp"
+	return 0
+}
+
+# 恢复 containerd 默认 root
+c2_containerd_root_revert() {
+	[ -f "$C2_CONTAINERD_CONF" ] || return 0
+	sed -i "s#^[[:space:]]*root[[:space:]]*=.*#root = \"/var/lib/containerd\"#" "$C2_CONTAINERD_CONF" 2>/dev/null
 	return 0
 }
 
@@ -2321,7 +2371,7 @@ c2_backup_root() {
 
 # 一键把软件安装到 SSD
 c2_apply() {
-	local root="${1:-}" docker_target web_target data_target was_running=0
+	local root="${1:-}" docker_target web_target data_target containerd_target was_running=0
 	[ -n "$root" ] || return 1
 	root="${root%/}"
 	case "$root" in
@@ -2338,18 +2388,25 @@ c2_apply() {
 	docker_target=$(c2_path_docker "$root")
 	web_target=$(c2_path_web "$root")
 	data_target=$(c2_path_docker_data "$root")
-	mkdir -p -- "$docker_target" "$web_target" "$data_target" 2>/dev/null || { echo "无法创建子目录"; return 1; }
+	containerd_target=$(c2_path_containerd_data "$root")
+	mkdir -p -- "$docker_target" "$web_target" "$data_target" "$containerd_target" 2>/dev/null || { echo "无法创建子目录"; return 1; }
 
 	if c2_docker_running; then was_running=1; fi
 	if [ "$was_running" = "1" ]; then
 		echo "正在停止 Docker 以便安全迁移数据..."
 		command -v docker >/dev/null 2>&1 && docker stop $(docker ps -q 2>/dev/null) >/dev/null 2>&1
 		c2_service_action stop docker
+		c2_service_action stop containerd
 	fi
 
 	echo "正在迁移 Docker 存储目录 (/var/lib/docker)..."
 	if [ -d /var/lib/docker ] && [ ! -L /var/lib/docker ]; then
 		c2_migrate_dir /var/lib/docker "$data_target" || { echo "迁移 Docker 存储目录失败"; return 1; }
+	fi
+
+	echo "正在迁移镜像层目录 (/var/lib/containerd)..."
+	if [ -d /var/lib/containerd ] && [ ! -L /var/lib/containerd ] && [ -n "$containerd_target" ]; then
+		c2_migrate_dir /var/lib/containerd "$containerd_target" || { echo "迁移 /var/lib/containerd 失败"; return 1; }
 	fi
 
 	echo "正在迁移应用数据目录 (/home/docker)..."
@@ -2364,12 +2421,18 @@ c2_apply() {
 	echo "正在设置 Docker data-root..."
 	c2_docker_data_root_apply "$data_target" || echo "设置 Docker data-root 失败，可稍后重试"
 
+	if [ -n "$containerd_target" ]; then
+		echo "正在设置 containerd 镜像层目录..."
+		c2_containerd_root_apply "$containerd_target" || echo "设置 containerd root 失败，可稍后重试"
+	fi
+
 	c2_setup_cache "$root" || echo "配置缓存目录失败"
 
 	c2_conf_save "$root" || { echo "保存配置失败"; return 1; }
 
 	if [ "$was_running" = "1" ]; then
 		echo "正在启动 Docker..."
+		c2_service_action start containerd
 		c2_service_action start docker
 	fi
 
@@ -2379,7 +2442,7 @@ c2_apply() {
 
 # 恢复默认布局：把数据搬回系统盘
 c2_revert() {
-	local root docker_target web_target data_target was_running=0
+	local root docker_target web_target data_target containerd_target was_running=0
 	c2_conf_load
 	if [ "$C2_ENABLED" != "true" ] || [ -z "$C2_STORAGE_ROOT" ]; then
 		echo "当前未启用 C2 存储模式"
@@ -2389,6 +2452,7 @@ c2_revert() {
 	docker_target=$(c2_path_docker "$root")
 	web_target=$(c2_path_web "$root")
 	data_target=$(c2_path_docker_data "$root")
+	containerd_target=$(c2_path_containerd_data "$root")
 
 	if c2_docker_running; then was_running=1; fi
 	if [ "$was_running" = "1" ]; then
@@ -2402,6 +2466,11 @@ c2_revert() {
 	[ -d "$docker_target" ] && c2_migrate_dir "$docker_target" /home/docker >/dev/null 2>&1
 	[ -d "$web_target" ] && c2_migrate_dir "$web_target" /home/web >/dev/null 2>&1
 	[ -d "$data_target" ] && c2_migrate_dir "$data_target" /var/lib/docker >/dev/null 2>&1
+	if [ -n "$containerd_target" ] && [ -d "$containerd_target" ]; then
+		c2_containerd_root_revert
+		mkdir -p /var/lib/containerd 2>/dev/null
+		c2_migrate_dir "$containerd_target" /var/lib/containerd >/dev/null 2>&1
+	fi
 
 	if [ -f /etc/docker/daemon.json ]; then
 		if command -v jq >/dev/null 2>&1 && jq empty /etc/docker/daemon.json >/dev/null 2>&1; then
@@ -2888,7 +2957,7 @@ install_add_docker_cn() {
 local country=$(curl -s ipinfo.io/country)
 if [ "$country" = "CN" ]; then
 	install jq
-	local registry_mirrors='["https://docker.1ms.run","https://docker.m.ixdev.cn","https://hub.rat.dev","https://dockerproxy.net","https://docker-registry.nmqu.com","https://docker.amingg.com","https://docker.hlmirror.com","https://hub1.nat.tf","https://hub2.nat.tf","https://hub3.nat.tf","https://docker.m.daocloud.io","https://docker.kejilion.pro","https://docker.367231.xyz","https://hub.1panel.dev","https://dockerproxy.cool","https://docker.apiba.cn","https://proxy.vvvv.ee"]'
+	local registry_mirrors='["https://docker.xuanyuan.me","https://docker.1ms.run","https://docker.m.daocloud.io","https://dockerproxy.net","https://docker.m.ixdev.cn","https://docker.amingg.com","https://docker.hlmirror.com","https://hub1.nat.tf","https://hub2.nat.tf","https://hub3.nat.tf","https://docker.kejilion.pro","https://dockerproxy.cool","https://docker.apiba.cn"]'
 
 	mkdir -p /etc/docker 2>/dev/null
 	if [ -f /etc/docker/daemon.json ] && jq empty /etc/docker/daemon.json >/dev/null 2>&1; then
