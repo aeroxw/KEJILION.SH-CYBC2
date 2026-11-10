@@ -1930,12 +1930,14 @@ c2_df_kb() {
 }
 
 c2_kb_to_human() {
+	# 输入单位是 KB。先换算成 GB 再决定标签，
+	# 否则 1.9T 的盘会被显示成 "1.8G"（数值对、标签错）
 	printf '%s' "${1:-}" | awk -F'\t' '
 		{
-			v = $1 / 1048576
-			if (v >= 1048576) printf "%.1fT", v / 1048576
-			else if (v >= 1024) printf "%.1fG", v / 1024
-			else printf "%.0fM", v
+			g = $1 / 1048576
+			if (g >= 1024) printf "%.1fT", g / 1024
+			else if (g >= 1) printf "%.1fG", g
+			else printf "%.0fM", g * 1024
 		}
 	'
 }
@@ -1958,15 +1960,20 @@ c2_df_avail() {
 
 # 块设备容量（读 /sys/block/<name>/size，单位为 512 字节扇区）
 c2_block_size_human() {
-	local name="${1:-}" sectors gb
+	local name="${1:-}" sectors gb tb
 	[ -n "$name" ] || return 1
 	sectors=$(cat "/sys/block/$name/size" 2>/dev/null)
 	[ -n "$sectors" ] || return 1
-	gb=$((sectors / 2097152))
-	if [ "$gb" -gt 0 ]; then
-		printf '%sG' "$gb"
+	tb=$((sectors / 2199023255552))
+	if [ "$tb" -gt 0 ]; then
+		printf '%sT' "$tb"
 	else
-		printf '%sM' "$((sectors * 512 / 1048576))"
+		gb=$((sectors / 2097152))
+		if [ "$gb" -gt 0 ]; then
+			printf '%sG' "$gb"
+		else
+			printf '%sM' "$((sectors * 512 / 1048576))"
+		fi
 	fi
 }
 
