@@ -2312,13 +2312,13 @@ c2_docker_data_root_apply() {
 # 此时必须开启 allow-direct-routing；IPv6 链路不可用时需关闭 ip6tables。
 c2_docker_network_quirks_apply() {
 	local conf="/etc/docker/daemon.json" need_raw=0 need_no6=0
-	command -v iptables >/dev/null 2>&1 || return 0
 	command -v jq >/dev/null 2>&1 || return 0
-	iptables -t raw -L -n >/dev/null 2>&1 || need_raw=1
+	if command -v iptables >/dev/null 2>&1; then
+		iptables -t raw -L -n >/dev/null 2>&1 || need_raw=1
+	fi
 	if command -v ip6tables >/dev/null 2>&1; then
 		ip6tables -t nat -L -n >/dev/null 2>&1 || need_no6=1
 	fi
-	[ "$need_raw" = "1" ] || [ "$need_no6" = "1" ] || return 0
 	[ -f "$conf" ] || return 0
 	jq empty "$conf" >/dev/null 2>&1 || return 0
 	# 注意：jq 的键名含连字符时必须用方括号写法。
@@ -2327,6 +2327,15 @@ c2_docker_network_quirks_apply() {
 	local filter='.'
 	[ "$need_raw" = "1" ] && filter="$filter | .[\"allow-direct-routing\"] = true"
 	[ "$need_no6" = "1" ] && filter="$filter | .[\"ip6tables\"] = false"
+	# 缺镜像加速器时兜底写入，否则 docker pull 会直连被污染的 Docker Hub
+	jq -e 'has("registry-mirrors")' "$conf" >/dev/null 2>&1 || \
+		filter="$filter | .[\"registry-mirrors\"] = [\"https://docker.xuanyuan.me\",\"https://docker.1ms.run\",\"https://docker.m.daocloud.io\"]"
+	# 缺 DNS 时兜底写入国内解析，实测 registry-1.docker.io 会被解析到异常 IPv6 地址
+	jq -e 'has("dns")' "$conf" >/dev/null 2>&1 || \
+		filter="$filter | .[\"dns\"] = [\"223.5.5.5\",\"119.29.29.29\"]"
+	if [ -z "$filter" ]; then
+		return 0
+	fi
 	jq "$filter" "$conf" > "${conf}.tmp" 2>/dev/null || { rm -f -- "${conf}.tmp"; return 1; }
 	mv -f -- "${conf}.tmp" "$conf" 2>/dev/null || { rm -f -- "${conf}.tmp"; return 1; }
 	[ "$need_raw" = "1" ] && echo -e "${gl_huang}检测到内核不支持 iptables raw 表，已开启 allow-direct-routing${gl_bai}"
