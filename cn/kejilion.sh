@@ -1933,7 +1933,8 @@ c2_kb_to_human() {
 	printf '%s' "${1:-}" | awk -F'\t' '
 		{
 			v = $1 / 1048576
-			if (v >= 1024) printf "%.1fG", v / 1024
+			if (v >= 1048576) printf "%.1fT", v / 1048576
+			else if (v >= 1024) printf "%.1fG", v / 1024
 			else printf "%.0fM", v
 		}
 	'
@@ -2283,21 +2284,50 @@ c2_docker_data_root_apply() {
 	mkdir -p -- "$(dirname -- "$conf")" 2>/dev/null
 	# systemd 环境下统一用 systemd cgroup driver，否则 cgroup v1 的 blkio 路径
 	# 缺失会让运行中的容器 healthcheck 失败（表现为 unhealthy）
+	# 注意：jq 的 {...} 是「构造新对象」，与输入无关；
+	# 与已有配置合并必须写成 . + {...}，否则原字段会被整体丢弃
 	local c2_extra='{"data-root": $dr}'
 	if [ -d /run/systemd/system ]; then
 		c2_extra='{"data-root": $dr, "exec-opts": ["native.cgroupdriver=systemd"]}'
 	fi
 	if [ -f "$conf" ] && [ -s "$conf" ]; then
 		if ! jq empty "$conf" >/dev/null 2>&1; then
+			# 配置损坏：备份后重建
 			cp -a -- "$conf" "${conf}.c2bak.$(date +%s)" 2>/dev/null
 			jq -n --arg dr "$target" "$c2_extra" > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
 		else
-			jq --arg dr "$target" "$c2_extra" "$conf" > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
+			jq --arg dr "$target" '. + '"$c2_extra" "$conf" > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
 		fi
 	else
 		jq -n --arg dr "$target" "$c2_extra" > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
 	fi
 	mv -f -- "${conf}.tmp" "$conf" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
+	return 0
+}
+
+# 按内核实际的 iptables 能力补齐 daemon.json
+# 云存宝 C2 的厂商内核裁掉了 ip_table_raw 模块，Docker 默认会往 raw 表写
+# 直连过滤规则，raw 表不存在时 docker run 必然失败：
+#   failed to set up container networking ... table 'raw': Table does not exist
+# 此时必须开启 allow-direct-routing；IPv6 链路不可用时需关闭 ip6tables。
+c2_docker_network_quirks_apply() {
+	local conf="/etc/docker/daemon.json" need_raw=0 need_no6=0
+	command -v iptables >/dev/null 2>&1 || return 0
+	command -v jq >/dev/null 2>&1 || return 0
+	iptables -t raw -L -n >/dev/null 2>&1 || need_raw=1
+	if command -v ip6tables >/dev/null 2>&1; then
+		ip6tables -t nat -L -n >/dev/null 2>&1 || need_no6=1
+	fi
+	[ "$need_raw" = "1" ] || [ "$need_no6" = "1" ] || return 0
+	[ -f "$conf" ] || return 0
+	jq empty "$conf" >/dev/null 2>&1 || return 0
+	local filter='.'
+	[ "$need_raw" = "1" ] && filter="$filter | .allow-direct-routing = true"
+	[ "$need_no6" = "1" ] && filter="$filter | .ip6tables = false"
+	jq "$filter" "$conf" > "${conf}.tmp" 2>/dev/null || { rm -f -- "${conf}.tmp"; return 1; }
+	mv -f -- "${conf}.tmp" "$conf" 2>/dev/null || { rm -f -- "${conf}.tmp"; return 1; }
+	[ "$need_raw" = "1" ] && echo -e "${gl_huang}检测到内核不支持 iptables raw 表，已开启 allow-direct-routing${gl_bai}"
+	[ "$need_no6" = "1" ] && echo -e "${gl_huang}检测到内核不支持 ip6tables，已关闭 IPv6 转发${gl_bai}"
 	return 0
 }
 
@@ -2434,6 +2464,7 @@ c2_apply() {
 
 	echo "正在设置 Docker data-root..."
 	c2_docker_data_root_apply "$data_target" || echo "设置 Docker data-root 失败，可稍后重试"
+	c2_docker_network_quirks_apply
 
 	if [ -n "$containerd_target" ]; then
 		echo "正在设置 containerd 镜像层目录..."

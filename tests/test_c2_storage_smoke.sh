@@ -189,5 +189,20 @@ if grep -Eq '^[[:space:]]*c2_root=\$\(c2_root\)' "$script_path"; then
 	exit 1
 fi
 
+# ---------------------------------------------------------------- daemon.json 合并回归
+# jq 的 {...} 是「构造新对象」，与输入无关。写 daemon.json 时若用裸对象，
+# 会把原有的 allow-direct-routing / ip6tables / registry-mirrors 整体丢弃。
+# 云存宝 C2 的内核裁掉了 ip_table_raw，丢失 allow-direct-routing 后
+# docker run 必然报 raw 表不存在，容器根本起不来。
+# 与已有配置合并必须写成 . + {...}
+if grep -Eq 'jq[[:space:]]+--arg[[:space:]]+dr[[:space:]]+"\$\{?target\}?"[[:space:]]+"\{' "$script_path"; then
+	echo "daemon.json is overwritten instead of merged (missing '. + ')" >&2
+	exit 1
+fi
+if ! grep -Eq "jq --arg dr \"\\\$target\" '\\. \\+ '" "$script_path"; then
+	echo "daemon.json merge form (. + {...}) not found" >&2
+	exit 1
+fi
+
 echo "c2_storage_smoke=pass"
 
