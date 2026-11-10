@@ -1908,9 +1908,26 @@ c2_rotate_probe() {
 	return 2
 }
 
+# 把设备路径解析为 sysfs 中的真实块设备名
+# /dev/mapper/vgdata-data -> dm-0，/dev/sda -> sda
+c2_dev_kernel_name() {
+	local src="${1:-}" base resolved
+	[ -n "$src" ] || return 1
+	base="${src##*/}"
+	[ -n "$base" ] || return 1
+	# DM/RAID 设备的 /dev 名字与 sysfs 不同，需要顺着链接找真实内核名
+	if [ ! -e "/sys/block/$base" ]; then
+		resolved=$(readlink -f -- "$src" 2>/dev/null)
+		if [ -n "$resolved" ]; then
+			base="${resolved##*/}"
+		fi
+	fi
+	printf '%s' "$base"
+}
+
 c2_dev_is_ssd() {
 	local src="${1:-}" base
-	base="${src##*/}"
+	base=$(c2_dev_kernel_name "$src")
 	[ -n "$base" ] || return 2
 	c2_rotate_probe "$base"
 }

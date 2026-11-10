@@ -129,16 +129,34 @@ on_system_disk() {
 	[ -n "$_root_dev" ] && [ "$_root_dev" = "$_sys_dev" ]
 }
 
+# 把设备路径解析为 sysfs 中的真实块设备名
+# /dev/mapper/vgdata-data -> dm-0
+dev_kernel_name() {
+	_src="${1:-}"
+	_base="${_src##*/}"
+	[ -n "$_base" ] || return 1
+	if [ ! -e "/sys/block/$_base" ]; then
+		_resolved=$(readlink -f -- "$_src" 2>/dev/null)
+		[ -n "$_resolved" ] && _base="${_resolved##*/}"
+	fi
+	printf '%s' "$_base"
+}
+
 # 设备是否为固态（非旋转）
 dev_is_ssd() {
 	_src="${1:-}"
-	_base="${_src##*/}"
+	_base=$(dev_kernel_name "$_src")
 	[ -n "$_base" ] || return 2
 	for _cand in "$_base" "${_base%p[0-9]}" "${_base%%[0-9]*}"; do
 		if [ -e "/sys/block/$_cand/queue/rotational" ]; then
 			[ "$(cat "/sys/block/$_cand/queue/rotational" 2>/dev/null)" = "0" ] && return 0
 			return 1
 		fi
+	done
+	# DM/LVM/RAID：沿 slaves 向下找物理盘
+	for _slave in /sys/class/block/"$_base"/slaves/*; do
+		[ -e "$_slave" ] || continue
+		dev_is_ssd "${_slave##*/}" && return 0
 	done
 	return 2
 }
