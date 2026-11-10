@@ -1,0 +1,9 @@
+# 脚本与配置文件统一使用 LF 行尾，避免在 Linux 上因 CRLF 导致执行失败
+*.sh text eol=lf
+*.conf text eol=lf
+*.cnf text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf

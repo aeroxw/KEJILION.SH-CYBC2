@@ -1787,11 +1787,477 @@ fi
 }
 
 
+# ============================================================================
+# 云存宝 C2 专用：SSD 存储配置模块
+# ----------------------------------------------------------------------------
+# 背景：云存宝 C2 为双 M.2 SSD 位设备，系统分区空间有限，而脚本默认把
+#       Docker 镜像与应用数据、建站数据全部堆在系统盘上，很容易撑爆系统分区。
+#
+# 方案：不去改动上游 751 处硬编码路径（会导致后续合并 upstream 持续冲突），
+#       而是把 /home/docker 与 /home/web 整体迁移到 SSD 并用符号链接接管，
+#       同时把 Docker data-root、包管理缓存与备份目录一并指向 SSD。
+#       这样既保持与上游兼容，也让后续 upstream 合并几乎零冲突。
+#
+# 配置文件：/etc/kejilion/c2.conf
+#       独立于脚本文件，脚本自动更新不会丢失配置。
+# ============================================================================
+
+C2_CONFIG_DIR="/etc/kejilion"
+C2_CONFIG_FILE="/etc/kejilion/c2.conf"
+C2_CONF_LOADED="false"
+C2_ENABLED="false"
+C2_STORAGE_ROOT=""
+
+# 读取配置（采用解析而非 source，避免执行任意内容）
+c2_conf_load() {
+	[ "$C2_CONF_LOADED" = "true" ] && return 0
+	C2_CONF_LOADED="true"
+	C2_ENABLED="false"
+	C2_STORAGE_ROOT=""
+	[ -f "$C2_CONFIG_FILE" ] || return 0
+	local enabled root
+	enabled=$(sed -n 's/^[[:space:]]*C2_ENABLED[[:space:]]*=[[:space:]]*\(.*\)$/\1/p' "$C2_CONFIG_FILE" 2>/dev/null | head -n1 | tr -d '"'"'"'[:space:]')
+	root=$(sed -n 's/^[[:space:]]*C2_STORAGE_ROOT[[:space:]]*=[[:space:]]*\(.*\)$/\1/p' "$C2_CONFIG_FILE" 2>/dev/null | head -n1 | tr -d '"'"'"' ')
+	[ "$enabled" = "true" ] && C2_ENABLED="true"
+	case "$root" in
+		/*) C2_STORAGE_ROOT="$root" ;;
+	esac
+	[ -n "$C2_STORAGE_ROOT" ] || C2_ENABLED="false"
+	return 0
+}
+
+c2_conf_save() {
+	local root="${1:-}"
+	case "$root" in
+		/*) ;;
+		*) return 1 ;;
+	esac
+	mkdir -p "$C2_CONFIG_DIR" 2>/dev/null || return 1
+	cat > "$C2_CONFIG_FILE" << EOF
+# 云存宝 C2 存储配置（由 kejilion.sh 生成，请勿手工编辑）
+C2_ENABLED="true"
+C2_STORAGE_ROOT="$root"
+EOF
+	chmod 0644 "$C2_CONFIG_FILE" 2>/dev/null
+	C2_ENABLED="true"
+	C2_STORAGE_ROOT="$root"
+	C2_CONF_LOADED="true"
+	return 0
+}
+
+c2_conf_clear() {
+	rm -f "$C2_CONFIG_FILE" 2>/dev/null
+	C2_ENABLED="false"
+	C2_STORAGE_ROOT=""
+	C2_CONF_LOADED="true"
+	return 0
+}
+
+# C2 模式是否启用
+c2_enabled() {
+	c2_conf_load
+	[ "$C2_ENABLED" = "true" ] && [ -n "$C2_STORAGE_ROOT" ]
+}
+
+# 存储根目录
+c2_root() {
+	c2_conf_load
+	printf '%s' "$C2_STORAGE_ROOT"
+}
+
+c2_path_docker() { printf '%s/docker' "${1:-}"; }
+c2_path_docker_data() { printf '%s/docker-data' "${1:-}"; }
+c2_path_web() { printf '%s/web' "${1:-}"; }
+c2_path_cache() { printf '%s/cache' "${1:-}"; }
+c2_path_backup() { printf '%s/backup' "${1:-}"; }
+
+# 判断路径是否为独立挂载点
+c2_is_mounted() {
+	local path="${1:-}" dev mp fstype
+	[ -n "$path" ] || return 1
+	path="${path%/}"
+	[ -n "$path" ] || path="/"
+	[ -d "$path" ] || return 1
+	while read -r dev mp fstype _rest; do
+		[ "$mp" = "$path" ] && return 0
+	done < /proc/mounts
+	return 1
+}
+
+# 判断源设备是否为固态硬盘(非旋转)
+c2_dev_is_ssd() {
+	local src="${1:-}" base cand
+	base="${src##*/}"
+	[ -n "$base" ] || return 2
+	for cand in "$base" "${base%p[0-9]}" "${base%%[0-9]*}"; do
+		if [ -e "/sys/block/$cand/queue/rotational" ]; then
+			if [ "$(cat "/sys/block/$cand/queue/rotational" 2>/dev/null)" = "0" ]; then
+				return 0
+			fi
+			return 1
+		fi
+	done
+	return 2
+}
+
+# 列出可作为 SSD 存储的候选挂载点
+c2_detect_candidates() {
+	local dev mp fstype size kind
+	while read -r dev mp fstype _rest; do
+		case "$fstype" in
+			tmpfs|devtmpfs|proc|sysfs|cgroup|cgroup2|overlay|squashfs|ramfs|fuseblk|efivarfs|debugfs|tracefs|securityfs|mqueue|hugetlbfs|configfs|pstore|bpf|binfmt_misc|nsfs|autofs|rootfs|udf|iso9660) continue ;;
+		esac
+		[ "$mp" = "/" ] && continue
+		[ -d "$mp" ] || continue
+		size=$(df -h -- "$mp" 2>/dev/null | awk 'NR==2 {print $2}')
+		[ -n "$size" ] || continue
+		if c2_dev_is_ssd "$dev"; then kind="SSD"; else kind="HDD"; fi
+		printf '%s\t%s\t%s\t%s\n' "$mp" "$dev" "$size" "$kind"
+	done < /proc/mounts
+}
+
+# 存储根是否与系统盘位于同一设备
+c2_on_system_disk() {
+	local root="${1:-/}" root_dev sys_dev
+	root_dev=$(stat -c %d -- "$root" 2>/dev/null) || return 1
+	sys_dev=$(stat -c %d -- / 2>/dev/null) || return 1
+	[ -n "$root_dev" ] && [ "$root_dev" = "$sys_dev" ]
+}
+
+# 建立符号链接，已指向同一目标时不做任何改动
+c2_symlink() {
+	local link="${1:-}" target="${2:-}"
+	[ -n "$link" ] && [ -n "$target" ] || return 1
+	mkdir -p -- "$(dirname -- "$link")" 2>/dev/null
+	if [ -L "$link" ]; then
+		# 链接目标一致则保持不动，避免重复重建
+		if c2_symlink_points_to "$link" "$target"; then
+			return 0
+		fi
+		rm -f -- "$link"
+	elif [ -d "$link" ]; then
+		# 路径被空目录占用时先移除，避免 ln -s 失败
+		rmdir -- "$link" 2>/dev/null || return 1
+	fi
+	ln -s -- "$target" "$link"
+}
+
+# 判断符号链接当前是否已指向目标目录
+# 先按字符串比较，再把两者都解析成绝对路径比较，最后退化为比较 inode，
+# 以适配不同环境下路径规范化方式的差异
+c2_symlink_points_to() {
+	local link="${1:-}" target="${2:-}" current resolved target_abs
+	[ -n "$link" ] && [ -n "$target" ] || return 1
+	[ -L "$link" ] || return 1
+	[ -d "$target" ] || return 1
+	current=$(readlink -- "$link" 2>/dev/null)
+	[ -n "$current" ] || return 1
+	[ "$current" = "$target" ] && return 0
+	# 把链接目标按链接所在目录展开，得到绝对路径
+	case "$current" in
+		/*) target_abs="$current" ;;
+		*) target_abs="$(dirname -- "$link")/$current" ;;
+	esac
+	[ "$target_abs" = "$target" ] && return 0
+	resolved=$(readlink -f -- "$link" 2>/dev/null)
+	[ -n "$resolved" ] || return 1
+	[ "$resolved" = "$(readlink -f -- "$target" 2>/dev/null)" ] && return 0
+	return 1
+}
+
+# 把源目录内容迁移到目标目录，随后源目录被软链接接管
+c2_migrate_dir() {
+	local src="${1:-}" dst="${2:-}" item
+	[ -n "$src" ] && [ -n "$dst" ] || return 1
+	[ -d "$dst" ] || mkdir -p -- "$dst" || return 1
+	if [ -L "$src" ]; then
+		if c2_symlink_points_to "$src" "$dst"; then
+			return 0
+		fi
+		rm -f -- "$src"
+	fi
+	if [ -d "$src" ] && [ ! -L "$src" ]; then
+		shopt -s dotglob nullglob
+		for item in "$src"/*; do
+			[ -e "$item" ] || [ -L "$item" ] || continue
+			mv -f -- "$item" "$dst/" || { shopt -u dotglob nullglob; return 1; }
+		done
+		shopt -u dotglob nullglob
+		# 迁移后源目录应为空，移除它为后续建立软链接让出路径；
+		# 若目录非空说明仍有残留内容，保留原目录以免丢失数据
+		rmdir -- "$src" 2>/dev/null || true
+	fi
+	return 0
+}
+
+# 写入 Docker data-root，保留 daemon.json 中已有的其它配置
+c2_docker_data_root_apply() {
+	local target="${1:-}" conf="/etc/docker/daemon.json"
+	[ -n "$target" ] || return 1
+	command -v jq >/dev/null 2>&1 || install jq >/dev/null 2>&1
+	command -v jq >/dev/null 2>&1 || return 1
+	mkdir -p -- "$target" 2>/dev/null || return 1
+	mkdir -p -- "$(dirname -- "$conf")" 2>/dev/null
+	if [ -f "$conf" ] && [ -s "$conf" ]; then
+		if ! jq empty "$conf" >/dev/null 2>&1; then
+			cp -a -- "$conf" "${conf}.c2bak.$(date +%s)" 2>/dev/null
+			jq -n --arg dr "$target" '{"data-root": $dr}' > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
+		else
+			jq --arg dr "$target" '. + {"data-root": $dr}' "$conf" > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
+		fi
+	else
+		jq -n --arg dr "$target" '{"data-root": $dr}' > "${conf}.tmp" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
+	fi
+	mv -f -- "${conf}.tmp" "$conf" 2>/dev/null || { rm -f "${conf}.tmp"; return 1; }
+	return 0
+}
+
+# 配置缓存与备份目录
+c2_setup_cache() {
+	local root="${1:-}" cache
+	[ -n "$root" ] || return 1
+	cache=$(c2_path_cache "$root")
+	mkdir -p -- "$cache/apt/archives/partial" "$cache/npm" "$cache/pip" "$cache/tmp" "$(c2_path_backup "$root")" 2>/dev/null || return 1
+	if [ -d /etc/apt/apt.conf.d ]; then
+		cat > /etc/apt/apt.conf.d/99kejilion-c2-storage.conf << EOF
+Dir::Cache "$cache/apt/";
+Dir::Cache::archives "$cache/apt/archives/";
+EOF
+	fi
+	command -v npm >/dev/null 2>&1 && npm config set cache "$cache/npm" >/dev/null 2>&1
+	command -v pip3 >/dev/null 2>&1 && pip3 config set global.cache-dir "$cache/pip" >/dev/null 2>&1
+	return 0
+}
+
+# Docker 备份目录：启用 C2 模式时落在 SSD 上
+c2_backup_root() {
+	local root=""
+	if c2_enabled; then
+		root="$(c2_path_backup "$(c2_root)")"
+		if mkdir -p -- "$root" 2>/dev/null; then
+			printf '%s' "$root"
+			return 0
+		fi
+	fi
+	printf '%s' "/tmp"
+}
+
+# 一键把软件安装到 SSD
+c2_apply() {
+	local root="${1:-}" docker_target web_target data_target was_running=0
+	[ -n "$root" ] || return 1
+	root="${root%/}"
+	case "$root" in
+		/*) ;;
+		*) echo "无效的存储目录: $root"; return 1 ;;
+	esac
+	mkdir -p -- "$root" 2>/dev/null || { echo "无法创建存储目录: $root"; return 1; }
+	# 提示用户：目标仍位于系统盘时软件并不会真正装到 SSD
+	if c2_on_system_disk "$root"; then
+		echo -e "${gl_huang}警告: $root 仍位于系统盘上，软件不会真正安装到 SSD。${gl_bai}"
+		echo "请确认 SSD 已挂载，并选择挂载点下的目录。"
+		return 1
+	fi
+	docker_target=$(c2_path_docker "$root")
+	web_target=$(c2_path_web "$root")
+	data_target=$(c2_path_docker_data "$root")
+	mkdir -p -- "$docker_target" "$web_target" "$data_target" 2>/dev/null || { echo "无法创建子目录"; return 1; }
+
+	if command -v docker >/dev/null 2>&1; then
+		if docker info >/dev/null 2>&1; then was_running=1; fi
+	fi
+	if [ "$was_running" = "1" ]; then
+		echo "正在停止 Docker 以便安全迁移数据..."
+		docker stop $(docker ps -q) >/dev/null 2>&1
+		systemctl stop docker >/dev/null 2>&1 || service docker stop >/dev/null 2>&1
+	fi
+
+	echo "正在迁移 Docker 存储目录 (/var/lib/docker)..."
+	if [ -d /var/lib/docker ] && [ ! -L /var/lib/docker ]; then
+		c2_migrate_dir /var/lib/docker "$data_target" || { echo "迁移 Docker 存储目录失败"; return 1; }
+	fi
+
+	echo "正在迁移应用数据目录 (/home/docker)..."
+	c2_migrate_dir /home/docker "$docker_target" || { echo "迁移 /home/docker 失败"; return 1; }
+
+	echo "正在迁移建站目录 (/home/web)..."
+	c2_migrate_dir /home/web "$web_target" || { echo "迁移 /home/web 失败"; return 1; }
+
+	c2_symlink /home/docker "$docker_target" || { echo "创建 /home/docker 链接失败"; return 1; }
+	c2_symlink /home/web "$web_target" || { echo "创建 /home/web 链接失败"; return 1; }
+
+	echo "正在设置 Docker data-root..."
+	c2_docker_data_root_apply "$data_target" || echo "设置 Docker data-root 失败，可稍后重试"
+
+	c2_setup_cache "$root" || echo "配置缓存目录失败"
+
+	c2_conf_save "$root" || { echo "保存配置失败"; return 1; }
+
+	if [ "$was_running" = "1" ]; then
+		echo "正在启动 Docker..."
+		systemctl start docker >/dev/null 2>&1 || service docker start >/dev/null 2>&1
+	fi
+
+	echo -e "${gl_lv}软件安装目录已切换到 SSD: ${root}${gl_bai}"
+	return 0
+}
+
+# 恢复默认布局：把数据搬回系统盘
+c2_revert() {
+	local root docker_target web_target data_target was_running=0
+	c2_conf_load
+	if [ "$C2_ENABLED" != "true" ] || [ -z "$C2_STORAGE_ROOT" ]; then
+		echo "当前未启用 C2 存储模式"
+		return 0
+	fi
+	root="${C2_STORAGE_ROOT%/}"
+	docker_target=$(c2_path_docker "$root")
+	web_target=$(c2_path_web "$root")
+	data_target=$(c2_path_docker_data "$root")
+
+	if command -v docker >/dev/null 2>&1; then
+		if docker info >/dev/null 2>&1; then was_running=1; fi
+	fi
+	if [ "$was_running" = "1" ]; then
+		docker stop $(docker ps -q) >/dev/null 2>&1
+		systemctl stop docker >/dev/null 2>&1 || service docker stop >/dev/null 2>&1
+	fi
+
+	[ -L /home/docker ] && rm -f /home/docker
+	[ -L /home/web ] && rm -f /home/web
+	mkdir -p /home/docker /home/web /var/lib/docker 2>/dev/null
+	[ -d "$docker_target" ] && c2_migrate_dir "$docker_target" /home/docker >/dev/null 2>&1
+	[ -d "$web_target" ] && c2_migrate_dir "$web_target" /home/web >/dev/null 2>&1
+	[ -d "$data_target" ] && c2_migrate_dir "$data_target" /var/lib/docker >/dev/null 2>&1
+
+	if [ -f /etc/docker/daemon.json ]; then
+		if command -v jq >/dev/null 2>&1 && jq empty /etc/docker/daemon.json >/dev/null 2>&1; then
+			jq 'del(.["data-root"])' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null &&
+				mv -f /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+		fi
+	fi
+
+	c2_conf_clear
+	rm -f /etc/apt/apt.conf.d/99kejilion-c2-storage.conf 2>/dev/null
+	if [ "$was_running" = "1" ]; then
+		systemctl start docker >/dev/null 2>&1 || service docker start >/dev/null 2>&1
+	fi
+	echo -e "${gl_lv}已恢复默认布局，软件数据回到系统盘${gl_bai}"
+	return 0
+}
+
+# 显示当前存储状态
+c2_status() {
+	local root docker_target web_target data_target
+	c2_conf_load
+	echo -e "${gl_kjlan}云存宝C2 存储状态${gl_bai}"
+	echo "------------------------------------------------"
+	if [ "$C2_ENABLED" = "true" ] && [ -n "$C2_STORAGE_ROOT" ]; then
+		root="${C2_STORAGE_ROOT%/}"
+		echo -e "模式: ${gl_lv}已启用 SSD 存储${gl_bai}"
+		echo "存储根目录: $root"
+		docker_target=$(c2_path_docker "$root")
+		web_target=$(c2_path_web "$root")
+		data_target=$(c2_path_docker_data "$root")
+		for item in "$docker_target" "$web_target" "$data_target"; do
+			[ -d "$item" ] && echo "  $item  $(df -h -- "$item" 2>/dev/null | awk 'NR==2 {print $2" 可用 "$4}')"
+		done
+		echo "/home/docker -> $(readlink -f /home/docker 2>/dev/null || echo '未链接')"
+		echo "/home/web    -> $(readlink -f /home/web 2>/dev/null || echo '未链接')"
+		if [ -f /etc/docker/daemon.json ] && command -v jq >/dev/null 2>&1; then
+			echo "Docker data-root: $(jq -r '."data-root" // "未设置"' /etc/docker/daemon.json 2>/dev/null)"
+		fi
+	else
+		echo -e "模式: ${gl_hui}未启用（软件安装在系统盘）${gl_bai}"
+	fi
+	echo "------------------------------------------------"
+}
+
+c2_menu() {
+	root_use
+	while true; do
+		clear
+		c2_status
+		echo ""
+		echo -e "${gl_kjlan}1.   ${gl_bai}自动检测 SSD 并一键配置"
+		echo -e "${gl_kjlan}2.   ${gl_bai}手动指定存储目录并配置"
+		echo -e "${gl_kjlan}3.   ${gl_bai}补齐迁移未迁移的数据到 SSD"
+		echo -e "${gl_kjlan}4.   ${gl_bai}恢复默认布局（搬回系统盘）"
+		echo -e "${gl_kjlan}5.   ${gl_bai}查看 SSD 候选挂载点"
+		echo -e "${gl_kjlan}------------------------${gl_bai}"
+		echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级选单"
+		echo -e "${gl_kjlan}------------------------${gl_bai}"
+		read -e -p "请输入你的选择: " sub_choice
+		case $sub_choice in
+			1)
+				clear
+				c2_auto_select
+				;;
+			2)
+				clear
+				read -e -p "请输入 SSD 存储目录 (例如 /mnt/ssd/kejilion): " c2_manual_path
+				[ -n "$c2_manual_path" ] && c2_apply "$c2_manual_path"
+				;;
+			3)
+				clear
+				c2_conf_load
+				if [ "$C2_ENABLED" = "true" ] && [ -n "$C2_STORAGE_ROOT" ]; then
+					c2_apply "$C2_STORAGE_ROOT"
+				else
+					echo "尚未启用 C2 存储模式，请先执行 1 或 2"
+				fi
+				;;
+			4)
+				clear
+				c2_revert
+				;;
+			5)
+				clear
+				echo -e "${gl_kjlan}可用的存储挂载点:${gl_bai}"
+				c2_detect_candidates | while IFS=$'\t' read -r mp dev size kind; do
+					echo "  $mp  设备=$dev  容量=$size  类型=$kind"
+				done
+				echo ""
+				;;
+			*)
+				break
+				;;
+		esac
+		read -e -p "按回车键继续..." _c2_ignore
+	done
+}
+
+# 自动检测 SSD 候选并让用户选择
+c2_auto_select() {
+	local candidates count=0 index=1 mp dev size kind pick target
+	candidates=$(c2_detect_candidates)
+	if [ -z "$candidates" ]; then
+		echo -e "${gl_huang}未检测到独立的存储挂载点${gl_bai}"
+		echo "请确认 SSD 已正确挂载，或使用选项 2 手动指定目录。"
+		return 1
+	fi
+	echo -e "${gl_kjlan}检测到的存储挂载点:${gl_bai}"
+	while IFS=$'\t' read -r mp dev size kind; do
+		echo "  $index. $mp  设备=$dev  容量=$size  类型=$kind"
+		index=$((index + 1))
+		count=$((count + 1))
+	done <<< "$candidates"
+	read -e -p "请选择要使用的挂载点 (序号): " pick
+	case "$pick" in
+		''|*[!0-9]*) echo "无效的选择"; return 1 ;;
+	esac
+	target=$(printf '%s\n' "$candidates" | sed -n "${pick}p" | cut -f1)
+	[ -n "$target" ] || { echo "无效的选择"; return 1; }
+	echo "将使用存储目录: $target/kejilion"
+	c2_apply "$target/kejilion"
+}
+
 
 if ! kpanel_protocol_active; then
 	canshu_v6
 	CheckFirstRun_true
 	yinsiyuanquan2
+	c2_conf_load
 
 	sed -i '/^alias k=/d' ~/.bashrc > /dev/null 2>&1
 	sed -i '/^alias k=/d' ~/.profile > /dev/null 2>&1
@@ -2091,29 +2557,27 @@ install_add_docker_cn() {
 
 local country=$(curl -s ipinfo.io/country)
 if [ "$country" = "CN" ]; then
-	cat > /etc/docker/daemon.json << EOF
-{
-  "registry-mirrors": [
-	"https://docker.1ms.run",
-	"https://docker.m.ixdev.cn",
-	"https://hub.rat.dev",
-	"https://dockerproxy.net",
-	"https://docker-registry.nmqu.com",
-	"https://docker.amingg.com",
-	"https://docker.hlmirror.com",
-	"https://hub1.nat.tf",
-	"https://hub2.nat.tf",
-	"https://hub3.nat.tf",
-	"https://docker.m.daocloud.io",
-	"https://docker.kejilion.pro",
-	"https://docker.367231.xyz",
-	"https://hub.1panel.dev",
-	"https://dockerproxy.cool",
-	"https://docker.apiba.cn",
-	"https://proxy.vvvv.ee"
-  ]
-}
-EOF
+	install jq
+	local registry_mirrors='["https://docker.1ms.run","https://docker.m.ixdev.cn","https://hub.rat.dev","https://dockerproxy.net","https://docker-registry.nmqu.com","https://docker.amingg.com","https://docker.hlmirror.com","https://hub1.nat.tf","https://hub2.nat.tf","https://hub3.nat.tf","https://docker.m.daocloud.io","https://docker.kejilion.pro","https://docker.367231.xyz","https://hub.1panel.dev","https://dockerproxy.cool","https://docker.apiba.cn","https://proxy.vvvv.ee"]'
+
+	mkdir -p /etc/docker 2>/dev/null
+	if [ -f /etc/docker/daemon.json ] && jq empty /etc/docker/daemon.json >/dev/null 2>&1; then
+		# 合并镜像源，保留用户已有的 data-root 等其它配置
+		jq --argjson mirrors "$registry_mirrors" '. + {"registry-mirrors": $mirrors}' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp 2>/dev/null &&
+			mv -f /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+	else
+		jq -n --argjson mirrors "$registry_mirrors" '{"registry-mirrors": $mirrors}' > /etc/docker/daemon.json 2>/dev/null
+	fi
+fi
+
+# 云存宝C2: 安装完成后把 Docker 数据目录指向 SSD
+if c2_enabled; then
+	local c2_base c2_data_target
+	c2_base=$(c2_root)
+	c2_data_target=$(c2_path_docker_data "$c2_base")
+	if [ -d "$c2_data_target" ]; then
+		c2_docker_data_root_apply "$c2_data_target" >/dev/null 2>&1
+	fi
 fi
 
 
@@ -3277,7 +3741,7 @@ install_ldnmp() {
 	  fix_phpfpm_conf php74
 
 	  # mysql调优
-	  wget -O /home/custom_mysql_config.cnf ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/custom_mysql_config-1.cnf
+	  wget -O /home/custom_mysql_config.cnf ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/custom_mysql_config-1.cnf
 	  docker cp /home/custom_mysql_config.cnf mysql:/etc/mysql/conf.d/
 	  rm -rf /home/custom_mysql_config.cnf
 
@@ -3301,7 +3765,7 @@ install_certbot() {
 	if [ ! -e auto_cert_renewal.sh ] && [ ! -L auto_cert_renewal.sh ]; then
 		local renewal_download renewal_digest
 		renewal_download=$(mktemp ./auto_cert_renewal.sh.XXXXXX) || return 1
-		if ! curl -fsS --max-time 30 -o "$renewal_download" "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/auto_cert_renewal.sh"; then
+		if ! curl -fsS --max-time 30 -o "$renewal_download" "${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/auto_cert_renewal.sh"; then
 			rm -f "$renewal_download"
 			return 1
 		fi
@@ -6618,13 +7082,13 @@ ldnmp_optimization_mode() {
 	sed -i "s/worker_processes.*/worker_processes ${cpu_cores};/" /home/web/nginx.conf
 	sed -i "s/worker_connections.*/worker_connections ${connections};/" /home/web/nginx.conf
 
-	wget -O /home/optimized_php.ini "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/optimized_php.ini" &&
+	wget -O /home/optimized_php.ini "${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/optimized_php.ini" &&
 		docker cp /home/optimized_php.ini php:/usr/local/etc/php/conf.d/optimized_php.ini
 	docker inspect php74 >/dev/null 2>&1 &&
 		docker cp /home/optimized_php.ini php74:/usr/local/etc/php/conf.d/optimized_php.ini
 	rm -f /home/optimized_php.ini
 
-	wget -O /home/www.conf "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/${php_fpm_source}" &&
+	wget -O /home/www.conf "${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/${php_fpm_source}" &&
 		docker cp /home/www.conf php:/usr/local/etc/php-fpm.d/www.conf
 	docker inspect php74 >/dev/null 2>&1 &&
 		docker cp /home/www.conf php74:/usr/local/etc/php-fpm.d/www.conf
@@ -6640,7 +7104,7 @@ ldnmp_optimization_mode() {
 	docker inspect php74 >/dev/null 2>&1 && fix_phpfpm_conf php74
 
 	wget -O /home/custom_mysql_config.cnf \
-		"${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/${mysql_source}" &&
+		"${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/${mysql_source}" &&
 		docker cp /home/custom_mysql_config.cnf mysql:/etc/mysql/conf.d/
 	rm -f /home/custom_mysql_config.cnf
 
@@ -7071,6 +7535,21 @@ setup_docker_dir() {
 	fi
 
 	mkdir -p /home /home/docker 2>/dev/null
+
+	# 云存宝C2: 优先使用用户指定的 SSD 存储目录
+	if c2_enabled; then
+		local c2_base c2_docker_target
+		c2_base=$(c2_root)
+		c2_docker_target=$(c2_path_docker "$c2_base")
+		if [ -d "$c2_docker_target" ]; then
+			# 已经是软链接则无需处理
+			if [ ! -L /home/docker ]; then
+				c2_migrate_dir /home/docker "$c2_docker_target" >/dev/null 2>&1
+				c2_symlink /home/docker "$c2_docker_target" >/dev/null 2>&1
+			fi
+			return 0
+		fi
+	fi
 
 	if [ -d "/vol1/1000/" ] && [ ! -d "/vol1/1000/docker" ]; then
 		cp -f /home/docker /home/docker1 2>/dev/null
@@ -8548,7 +9027,7 @@ kpanel_system_tuning_kernel_auto() {
 		return 1
 	}
 	script="$(mktemp /tmp/kejilion-system-tuning-network.XXXXXX)" || return 1
-	url="${gh_proxy}raw.githubusercontent.com/kejilion/sh/${KPANEL_SYSTEM_TUNING_NETWORK_COMMIT}/network-optimize.sh"
+	url="${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/${KPANEL_SYSTEM_TUNING_NETWORK_COMMIT}/network-optimize.sh"
 	kpanel_system_tuning_download_verified "$url" "$KPANEL_SYSTEM_TUNING_NETWORK_SHA256" "$script" || { rm -f -- "$script"; return 1; }
 	kpanel_system_tuning_run_command bash "$script"
 	local result=$?
@@ -12197,7 +12676,7 @@ bbrv3() {
 				local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
 				local list_file="/etc/apt/sources.list.d/xanmod-release.list"
 				local key_url="https://dl.xanmod.org/archive.key"
-				local fallback_key_url="${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/archive.key"
+				local fallback_key_url="${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/archive.key"
 				local os_codename=""
 
 				if command -v lsb_release >/dev/null 2>&1; then
@@ -13166,14 +13645,14 @@ Kernel_optimize() {
 			  cd ~
 			  clear
 			  restore_defaults
-			  curl -sS ${gh_proxy}raw.githubusercontent.com/kejilion/sh/refs/heads/main/network-optimize.sh -o /tmp/network-optimize.sh && source /tmp/network-optimize.sh && restore_network_defaults
+			  curl -sS ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/refs/heads/main/network-optimize.sh -o /tmp/network-optimize.sh && source /tmp/network-optimize.sh && restore_network_defaults
 			  send_stats "还原默认设置"
 			  ;;
 
 		  7)
 			  cd ~
 			  clear
-			  curl -sS ${gh_proxy}raw.githubusercontent.com/kejilion/sh/refs/heads/main/network-optimize.sh | bash
+			  curl -sS ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/refs/heads/main/network-optimize.sh | bash
 			  send_stats "内核自动调优"
 			  ;;
 
@@ -14795,7 +15274,8 @@ docker_ssh_migration() {
 	}
 
 	list_backups() {
-		local BACKUP_ROOT="/tmp"
+		local BACKUP_ROOT
+		BACKUP_ROOT=$(c2_backup_root)
 		echo -e "${gl_kjlan}当前备份列表:${gl_bai}"
 		ls -1dt ${BACKUP_ROOT}/docker_backup_* 2>/dev/null || echo "无备份"
 	}
@@ -14815,7 +15295,8 @@ docker_ssh_migration() {
 		install tar jq gzip
 		install_docker
 
-		local BACKUP_ROOT="/tmp"
+		local BACKUP_ROOT
+		BACKUP_ROOT=$(c2_backup_root)
 		local DATE_STR=$(date +%Y%m%d_%H%M%S)
 		local TARGET_CONTAINERS=()
 		if [ -z "$containers" ]; then
@@ -18511,7 +18992,7 @@ cf_shield_install_script() {
 	download=$(mktemp "$directory/.CF-Under-Attack.download.XXXXXX") || exit 1
 	stage=$(mktemp "$directory/.CF-Under-Attack.stage.XXXXXX") || { rm -f -- "$download"; exit 1; }
 	trap 'rm -f -- "$download" "$stage"' EXIT
-	url="${gh_prefix}raw.githubusercontent.com/kejilion/sh/${revision}/CF-Under-Attack.sh"
+	url="${gh_prefix}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/${revision}/CF-Under-Attack.sh"
 	if ! curl --fail --location --silent --show-error --connect-timeout 10 --max-time 45 --output "$download" "$url"; then
 		echo "Cloudflare 五秒盾脚本下载失败" >&2
 		exit 1
@@ -19866,7 +20347,7 @@ linux_ldnmp() {
 	  read -e -p "输入远程服务器密码: " usepasswd
 
 	  cd ~
-	  wget -O ${useip}_beifen.sh ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/beifen.sh > /dev/null 2>&1
+	  wget -O ${useip}_beifen.sh ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/beifen.sh > /dev/null 2>&1
 	  chmod +x ${useip}_beifen.sh
 
 	  sed -i "s/0.0.0.0/$useip/g" ${useip}_beifen.sh
@@ -25877,7 +26358,7 @@ run_ai_cli_manager() (
 	case "$app" in claude-code|codex|opencode|antigravity-cli|cursor) ;; *) return 1 ;; esac
 	manager=$(mktemp "${TMPDIR:-/tmp}/kejilion-ai-cli.XXXXXX") || return 1
 	trap 'rm -f -- "$manager"' EXIT
-	curl -fLsS --connect-timeout 15 --max-time 120 "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/ai_cli_manager.sh" -o "$manager" || return 1
+	curl -fLsS --connect-timeout 15 --max-time 120 "${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/ai_cli_manager.sh" -o "$manager" || return 1
 	[ -s "$manager" ] && bash -n "$manager" || return 1
 	. "$manager" || return 1
 	ai_cli_main "$app"
@@ -29758,11 +30239,11 @@ discourse,yunsou,ahhhhfs,nsgame,gying" \
 		  ;;
 
 	  115|hermes)
-	  	  bash <(curl -sL ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/hermes_manager.sh)
+	  	  bash <(curl -sL ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/hermes_manager.sh)
 		  ;;
 
 	  116|deepseek-harness|DeepSeek-Harness|dsh)
-		  bash <(curl -fsSL ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/deepseek_harness_manager.sh)
+		  bash <(curl -fsSL ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/deepseek_harness_manager.sh)
 		  ;;
 
 	  119|claude-code|claude)
@@ -34978,6 +35459,7 @@ linux_Settings() {
 	  echo -e "${gl_kjlan}39.  ${gl_bai}命令收藏夹 ${gl_huang}★${gl_bai}                       ${gl_kjlan}40.  ${gl_bai}网卡管理工具"
 	  echo -e "${gl_kjlan}------------------------"
 	  echo -e "${gl_kjlan}41.  ${gl_bai}系统日志管理工具 ${gl_huang}★${gl_bai}                 ${gl_kjlan}42.  ${gl_bai}系统变量管理工具"
+	  echo -e "${gl_kjlan}43.  ${gl_bai}云存宝C2存储配置(装到SSD) ${gl_huang}★${gl_bai}"
 	  echo -e "${gl_kjlan}------------------------"
 	  echo -e "${gl_kjlan}61.  ${gl_bai}留言板                             ${gl_kjlan}66.  ${gl_bai}一条龙系统调优 ${gl_huang}★${gl_bai}"
 	  echo -e "${gl_kjlan}99.  ${gl_bai}重启服务器                         ${gl_kjlan}100. ${gl_bai}隐私与安全"
@@ -35779,7 +36261,7 @@ EOF
 					  chmod +x ~/TG-check-notify.sh
 					  nano ~/TG-check-notify.sh
 				  else
-					  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/TG-check-notify.sh
+					  curl -sS -O ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/TG-check-notify.sh
 					  chmod +x ~/TG-check-notify.sh
 					  nano ~/TG-check-notify.sh
 				  fi
@@ -35788,7 +36270,7 @@ EOF
 				  crontab -l | grep -v '~/TG-check-notify.sh' | crontab - > /dev/null 2>&1
 				  (crontab -l ; echo "@reboot tmux new -d -s TG-check-notify '~/TG-check-notify.sh'") | crontab - > /dev/null 2>&1
 
-				  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/TG-SSH-check-notify.sh > /dev/null 2>&1
+				  curl -sS -O ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/TG-SSH-check-notify.sh > /dev/null 2>&1
 				  sed -i "3i$(grep '^TELEGRAM_BOT_TOKEN=' ~/TG-check-notify.sh)" TG-SSH-check-notify.sh > /dev/null 2>&1
 				  sed -i "4i$(grep '^CHAT_ID=' ~/TG-check-notify.sh)" TG-SSH-check-notify.sh
 				  chmod +x ~/TG-SSH-check-notify.sh
@@ -35820,7 +36302,7 @@ EOF
 			  root_use
 			  send_stats "修复SSH高危漏洞"
 			  cd ~
-			  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/upgrade_openssh9.8p1.sh
+			  curl -sS -O ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/upgrade_openssh9.8p1.sh
 			  chmod +x ~/upgrade_openssh9.8p1.sh
 			  ~/upgrade_openssh9.8p1.sh
 			  rm -f ~/upgrade_openssh9.8p1.sh
@@ -35896,6 +36378,11 @@ EOF
 		  42)
 			  clear
 			  env_menu
+			  ;;
+
+		  43)
+			  clear
+			  c2_menu
 			  ;;
 
 
@@ -36456,7 +36943,7 @@ echo -e "${gl_kjlan}B站: ${gl_bai}https://b23.tv/2mqnQyh              ${gl_kjla
 echo -e "${gl_kjlan}官网: ${gl_bai}https://kejilion.pro/              ${gl_kjlan}导航: ${gl_bai}https://dh.kejilion.pro/${gl_bai}"
 echo -e "${gl_kjlan}博客: ${gl_bai}https://blog.kejilion.pro/         ${gl_kjlan}软件中心: ${gl_bai}https://app.kejilion.pro/${gl_bai}"
 echo "------------------------"
-echo -e "${gl_kjlan}脚本官网: ${gl_bai}https://kejilion.sh            ${gl_kjlan}GitHub地址: ${gl_bai}${gh_https_url}github.com/kejilion/sh${gl_bai}"
+echo -e "${gl_kjlan}脚本官网: ${gl_bai}https://kejilion.sh            ${gl_kjlan}GitHub地址: ${gl_bai}${gh_https_url}github.com/aeroxw/KEJILION.SH-CYBC2${gl_bai}"
 echo "------------------------"
 echo ""
 }
@@ -36480,11 +36967,11 @@ games_server_tools() {
 	  case $sub_choice in
 
 		  1) send_stats "幻兽帕鲁开服脚本" ; cd ~
-			 curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/palworld.sh ; chmod +x palworld.sh ; ./palworld.sh
+			 curl -sS -O ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/palworld.sh ; chmod +x palworld.sh ; ./palworld.sh
 			 exit
 			 ;;
 		  2) send_stats "我的世界开服脚本" ; cd ~
-			 curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/mc.sh ; chmod +x mc.sh ; ./mc.sh
+			 curl -sS -O ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/mc.sh ; chmod +x mc.sh ; ./mc.sh
 			 exit
 			 ;;
 
@@ -36531,12 +37018,12 @@ while true; do
 	clear
 	echo "更新日志"
 	echo "------------------------"
-	echo "全部日志: ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/kejilion_sh_log.txt"
+	echo "全部日志: ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/kejilion_sh_log.txt"
 	echo "------------------------"
 
-	curl -s --max-time 15 ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/kejilion_sh_log.txt | tail -n 30
+	curl -s --max-time 15 ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/kejilion_sh_log.txt | tail -n 30
 	# 只下载前5行获取版本号，避免下载整个脚本
-	local sh_v_new=$(curl -s --max-time 15 -r 0-200 ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/kejilion.sh | grep -o 'sh_v="[0-9.]*"' | head -1 | cut -d '"' -f 2)
+	local sh_v_new=$(curl -s --max-time 15 -r 0-200 ${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/kejilion.sh | grep -o 'sh_v="[0-9.]*"' | head -1 | cut -d '"' -f 2)
 
 	if [ -z "$sh_v_new" ]; then
 		echo -e "${gl_hong}无法获取最新版本信息，请检查网络连接${gl_bai}"
@@ -36569,9 +37056,9 @@ while true; do
 			local country=$(curl -s --max-time 5 ipinfo.io/country)
 			local download_url
 			if [ "$country" = "CN" ]; then
-				download_url="${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/cn/kejilion.sh"
+				download_url="${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/cn/kejilion.sh"
 			else
-				download_url="${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/kejilion.sh"
+				download_url="${gh_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/kejilion.sh"
 			fi
 
 			# 备份当前脚本
@@ -36621,7 +37108,7 @@ while true; do
 			fi
 
 			# 构建健壮的自动更新命令：下载到临时文件 → 校验 → 备份 → 替换 → 恢复本地设置 → 部署
-			SH_Update_task="cd ~ && tmp=\$(mktemp ~/kejilion_tmp.XXXXXX) && curl -sS --max-time 60 --fail -o \"\$tmp\" ${cron_proxy}raw.githubusercontent.com/kejilion/sh/main/kejilion.sh && [ -s \"\$tmp\" ] && head -1 \"\$tmp\" | grep -q '^#!/bin/bash' && cp -f ~/kejilion.sh ~/kejilion.sh.bak 2>/dev/null && chmod +x \"\$tmp\" && mv -f \"\$tmp\" ~/kejilion.sh"
+			SH_Update_task="cd ~ && tmp=\$(mktemp ~/kejilion_tmp.XXXXXX) && curl -sS --max-time 60 --fail -o \"\$tmp\" ${cron_proxy}raw.githubusercontent.com/aeroxw/KEJILION.SH-CYBC2/main/kejilion.sh && [ -s \"\$tmp\" ] && head -1 \"\$tmp\" | grep -q '^#!/bin/bash' && cp -f ~/kejilion.sh ~/kejilion.sh.bak 2>/dev/null && chmod +x \"\$tmp\" && mv -f \"\$tmp\" ~/kejilion.sh"
 			# 追加设置恢复
 			if [ -n "$cron_sed_cmd" ]; then
 				SH_Update_task="$SH_Update_task && $cron_sed_cmd"
@@ -37166,6 +37653,14 @@ else
 
 		info)
 			linux_info
+			;;
+
+		c2|c2storage)
+			c2_menu
+			;;
+
+		c2status)
+			c2_status
 			;;
 
 		fail2ban|f2b)
