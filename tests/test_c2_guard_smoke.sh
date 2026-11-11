@@ -264,4 +264,54 @@ grep -q 'reset-failed c2-guard' "$guard_path" ||
 grep -q 'heal_path_unit' "$guard_path" ||
 	fail "c2_guard.sh must self-heal a failed path unit"
 
+# --- 12. KPanel 集群私网 CIDR 白名单 ----------------------------------------
+# 回归：KPanel 的 .env 会被重装流程整体重写，白名单随之丢失，
+# 「集群 → 添加主机」就会报「该地址被网络安全策略拒绝」。
+export C2_GUARD_KPANEL_ENV="$sandbox/kpanel/.env"
+export C2_KPANEL_PRIVATE_CIDRS="10.31.3.0/24"
+mkdir -p "$sandbox/kpanel"
+
+cat >"$C2_GUARD_KPANEL_ENV" <<EOF
+KPANEL_PUBLIC_URL=http://10.31.3.201:3666
+KPANEL_SECURE_COOKIE=false
+KPANEL_ALLOW_IP_HOSTS=true
+KPANEL_TRUSTED_PROXY_CIDRS=127.0.0.0/8,::1/128
+EOF
+
+repair_kpanel_env
+_rc=$?
+[ "$_rc" -eq 10 ] || fail "repair_kpanel_env must report a change when the whitelist is missing (got $_rc)"
+grep -q '^KPANEL_CLUSTER_PRIVATE_CIDRS=10.31.3.0/24$' "$C2_GUARD_KPANEL_ENV" ||
+	fail "repair_kpanel_env did not add the cluster private CIDR whitelist"
+grep -q '^KPANEL_PUBLIC_URL=http://10.31.3.201:3666$' "$C2_GUARD_KPANEL_ENV" ||
+	fail "repair_kpanel_env must keep the existing .env keys"
+
+# 幂等：已经正确时不得再次改写
+_before=$(cat "$C2_GUARD_KPANEL_ENV")
+repair_kpanel_env
+_rc=$?
+[ "$_rc" -eq 0 ] || fail "repair_kpanel_env must be idempotent (got $_rc)"
+[ "$_before" = "$(cat "$C2_GUARD_KPANEL_ENV")" ] ||
+	fail "repair_kpanel_env rewrote an already correct .env"
+
+# 白名单被改窄时必须纠正回来，且不能出现重复键
+sed -i 's|^KPANEL_CLUSTER_PRIVATE_CIDRS=.*|KPANEL_CLUSTER_PRIVATE_CIDRS=10.0.0.0/8|' "$C2_GUARD_KPANEL_ENV"
+repair_kpanel_env >/dev/null
+[ "$(grep -c '^KPANEL_CLUSTER_PRIVATE_CIDRS=' "$C2_GUARD_KPANEL_ENV")" -eq 1 ] ||
+	fail "repair_kpanel_env must not duplicate the whitelist key"
+grep -q '^KPANEL_CLUSTER_PRIVATE_CIDRS=10.31.3.0/24$' "$C2_GUARD_KPANEL_ENV" ||
+	fail "repair_kpanel_env must restore the configured whitelist"
+
+# do_check 必须把这条规则纳入守护流程
+grep -q 'repair_kpanel_env' "$guard_path" ||
+	fail "c2_guard.sh must run repair_kpanel_env inside do_check"
+grep -q 'C2_GUARD_KPANEL_ENV' "$guard_path" ||
+	fail "c2_guard.sh must allow overriding the KPanel .env path"
+
+# 白名单丢失时，do_check 必须把它补回来
+sed -i '/^KPANEL_CLUSTER_PRIVATE_CIDRS=/d' "$C2_GUARD_KPANEL_ENV"
+do_check || fail "do_check returned non-zero"
+grep -q '^KPANEL_CLUSTER_PRIVATE_CIDRS=10.31.3.0/24$' "$C2_GUARD_KPANEL_ENV" ||
+	fail "do_check did not restore the KPanel cluster private CIDR whitelist"
+
 echo "c2_guard_smoke=pass"

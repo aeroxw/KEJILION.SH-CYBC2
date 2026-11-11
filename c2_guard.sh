@@ -15,6 +15,7 @@
 #     3. containerd：/etc/containerd/config.toml 的 root 必须落在 SSD
 #     4. 目录软链：/home/docker、/home/web 必须指向 SSD
 #     5. 存储挂载：存储根未挂载时告警
+#     6. KPanel：集群私网 CIDR 白名单必须保留，否则「集群 → 添加主机」被拒
 #
 # 用法：
 #   sh c2_guard.sh check              # 校验并修复（守护默认动作）
@@ -26,6 +27,8 @@
 #   C2_CONF_FILE      配置文件路径，默认 /etc/kejilion/c2.conf
 #   C2_GUARD_LOG      日志路径，默认 /var/log/c2-guard.log
 #   C2_GUARD_NO_DOCKER_RESTART=1  修复 Docker 配置后不重启 dockerd
+#   C2_KPANEL_PRIVATE_CIDRS  集群私网白名单，默认 10.31.0.0/16
+#   C2_GUARD_KPANEL_ENV       KPanel .env 路径，默认 /home/docker/kpanel/.env
 # =============================================================================
 
 C2_CONF_FILE="${C2_CONF_FILE:-/etc/kejilion/c2.conf}"
@@ -41,6 +44,10 @@ C2_GUARD_ROOT_SCRIPT="${C2_GUARD_ROOT_SCRIPT:-/root/kejilion.sh}"
 C2_GUARD_BIN_LINK="${C2_GUARD_BIN_LINK:-/usr/bin/k}"
 C2_GUARD_HOME_DOCKER="${C2_GUARD_HOME_DOCKER:-/home/docker}"
 C2_GUARD_HOME_WEB="${C2_GUARD_HOME_WEB:-/home/web}"
+# KPanel 集群私网白名单：面板容器默认不放行任何私网地址，
+# 导致「集群 → 添加主机」报 cluster_origin_blocked
+C2_GUARD_KPANEL_ENV="${C2_GUARD_KPANEL_ENV:-/home/docker/kpanel/.env}"
+C2_KPANEL_PRIVATE_CIDRS="${C2_KPANEL_PRIVATE_CIDRS:-10.31.0.0/16}"
 
 # C2 版脚本的标志：上游没有 c2_menu 函数
 C2_SCRIPT_MARKER="${C2_SCRIPT_MARKER:-c2_menu()}"
@@ -319,6 +326,50 @@ repair_containerd_root() {
 }
 
 # ---------------------------------------------------------------------------
+# KPanel 集群私网白名单
+# ---------------------------------------------------------------------------
+
+# 修复 KPanel 的集群私网 CIDR 白名单，返回 0 表示无需改动，返回 10 表示已改动
+# KPanel 的 .env 会在重装应用时被上游脚本整体重写，白名单随之丢失，
+# 导致「集群 → 添加主机」报：该地址被网络安全策略拒绝
+repair_kpanel_env() {
+	_env="${C2_GUARD_KPANEL_ENV:-/home/docker/kpanel/.env}"
+	[ -f "$_env" ] || return 0
+	_cidrs="${C2_KPANEL_PRIVATE_CIDRS:-}"
+	[ -n "$_cidrs" ] || return 0
+
+	_current=$(sed -n 's/^KPANEL_CLUSTER_PRIVATE_CIDRS=//p' "$_env" 2>/dev/null | head -n1)
+	[ "$_current" = "$_cidrs" ] && return 0
+
+	_tmp="${_env}.c2guard.$$"
+	if grep -q '^KPANEL_CLUSTER_PRIVATE_CIDRS=' "$_env" 2>/dev/null; then
+		sed "s|^KPANEL_CLUSTER_PRIVATE_CIDRS=.*|KPANEL_CLUSTER_PRIVATE_CIDRS=$_cidrs|" "$_env" > "$_tmp" 2>/dev/null
+	else
+		{ cat "$_env"; printf 'KPANEL_CLUSTER_PRIVATE_CIDRS=%s\n' "$_cidrs"; } > "$_tmp" 2>/dev/null
+	fi
+	[ -s "$_tmp" ] || { rm -f "$_tmp" 2>/dev/null; return 1; }
+	grep -q '^KPANEL_CLUSTER_PRIVATE_CIDRS=' "$_tmp" 2>/dev/null || { rm -f "$_tmp" 2>/dev/null; return 1; }
+
+	cp -p "$_env" "${_env}.bak.$(date +%s)" 2>/dev/null
+	mv -f "$_tmp" "$_env" 2>/dev/null || { rm -f "$_tmp" 2>/dev/null; return 1; }
+	chmod 600 "$_env" 2>/dev/null
+	log "已修复 KPanel 集群私网 CIDR 白名单: $_cidrs"
+	return 10
+}
+
+# 重建 KPanel 容器，让白名单环境变量真正生效
+recreate_kpanel() {
+	_env="${C2_GUARD_KPANEL_ENV:-/home/docker/kpanel/.env}"
+	_dir=$(dirname "$_env")
+	[ -f "$_dir/docker-compose.yml" ] || return 1
+	have_cmd docker || return 1
+	docker ps -a --filter 'name=^/kejilion-panel$' --format '{{.Names}}' 2>/dev/null |
+		grep -q '^kejilion-panel$' || return 1
+	( cd "$_dir" && docker compose --env-file .env up -d --force-recreate ) >/dev/null 2>&1 || return 1
+	return 0
+}
+
+# ---------------------------------------------------------------------------
 # 目录软链
 # ---------------------------------------------------------------------------
 
@@ -451,6 +502,14 @@ show_status() {
 	if [ -f "$C2_CONTAINERD_CONF" ]; then
 		printf '%s\n' "containerd root: $(sed -n 's/^root[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$C2_CONTAINERD_CONF" 2>/dev/null | head -n1)"
 	fi
+	if [ -f "$C2_GUARD_KPANEL_ENV" ]; then
+		_kp=$(sed -n 's/^KPANEL_CLUSTER_PRIVATE_CIDRS=//p' "$C2_GUARD_KPANEL_ENV" 2>/dev/null | head -n1)
+		if [ -n "$_kp" ]; then
+			printf '%s\n' "KPanel 集群私网白名单: ${GREEN}$_kp${NC}"
+		else
+			printf '%s\n' "KPanel 集群私网白名单: ${YELLOW}未设置（添加主机会被网络策略拒绝）${NC}"
+		fi
+	fi
 	printf '%s\n' "------------------------------------------------"
 }
 
@@ -515,13 +574,25 @@ do_check() {
 	check_symlink "$C2_GUARD_HOME_DOCKER" "${C2_STORAGE_ROOT%/}/docker"
 	check_symlink "$C2_GUARD_HOME_WEB" "${C2_STORAGE_ROOT%/}/web"
 
-	# 5. 挂载
+	# 5. KPanel 集群私网白名单
+	repair_kpanel_env
+	_rc=$?
+	if [ "$_rc" -eq 10 ]; then
+		if recreate_kpanel; then
+			info "${GREEN}已重建 KPanel 容器使 CIDR 白名单生效${NC}"
+		else
+			warn "KPanel 容器重建失败，白名单将在下次守护时重试"
+			log "KPanel 容器重建失败"
+		fi
+	fi
+
+	# 6. 挂载
 	if ! on_separate_fs "$C2_STORAGE_ROOT"; then
 		warn "存储根 $C2_STORAGE_ROOT 未挂载到独立文件系统，软件无法落到 SSD"
 		log "存储根未挂载"
 	fi
 
-	# 6. 需要时重启 docker 让配置生效
+	# 7. 需要时重启 docker 让配置生效
 	if [ "$_need_restart" = "1" ] && [ "${C2_GUARD_NO_DOCKER_RESTART:-0}" != "1" ]; then
 		if have_cmd systemctl && systemctl is-active --quiet docker.service 2>/dev/null; then
 			log "Docker 配置已变更，正在重启 dockerd"
@@ -529,7 +600,7 @@ do_check() {
 		fi
 	fi
 
-	# 7. 自愈：确保路径监视单元还在工作
+	# 8. 自愈：确保路径监视单元还在工作
 	heal_path_unit
 	return 0
 }
