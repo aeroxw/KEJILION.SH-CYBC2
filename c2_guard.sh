@@ -170,14 +170,57 @@ canonical_path() {
 }
 
 # 确保 SSD 上存在可用的权威副本，返回其路径
+same_file() {
+	_a="${1:-}"
+	_b="${2:-}"
+	[ -f "$_a" ] && [ -f "$_b" ] || return 1
+	if have_cmd cmp; then
+		cmp -s "$_a" "$_b" 2>/dev/null
+		return $?
+	fi
+	[ "$(md5sum "$_a" 2>/dev/null | awk '{print $1}')" = \
+		"$(md5sum "$_b" 2>/dev/null | awk '{print $1}')" ]
+}
+
+# 原子安装：先写临时文件再 rename 覆盖目标。
+# 必须这么做——cp 原地覆盖会改动同一个 inode，正在运行该脚本的 shell
+# 按字节偏移续读时会读到错位的片段，抛出 "syntax error: unexpected EOF"。
+# rename 只替换目录项，运行中的进程仍持有旧 inode，不受影响。
+atomic_install() {
+	_src="${1:-}"
+	_dst="${2:-}"
+	[ -n "$_src" ] && [ -n "$_dst" ] || return 1
+	[ -f "$_src" ] || return 1
+	_tmp="$_dst.c2guard.$$"
+	cp -f "$_src" "$_tmp" 2>/dev/null || { rm -f "$_tmp" 2>/dev/null; return 1; }
+	chmod 0755 "$_tmp" 2>/dev/null
+	mv -f "$_tmp" "$_dst" 2>/dev/null || { rm -f "$_tmp" 2>/dev/null; return 1; }
+	return 0
+}
+
 ensure_canonical() {
 	_canon=$(canonical_path)
+	_mkdir=$(dirname "$_canon")
+	[ -d "$_mkdir" ] || mkdir -p "$_mkdir" 2>/dev/null || return 1
+
+	# 优先用本机已安装的 C2 版脚本刷新权威副本。
+	# 它一定不旧于磁盘上的快照——否则守护会用旧快照回滚用户刚更新的脚本。
+	for _src in "$C2_GUARD_SCRIPT_PATH" "$C2_GUARD_ROOT_SCRIPT"; do
+		if script_is_c2 "$_src"; then
+			if ! same_file "$_src" "$_canon"; then
+				if atomic_install "$_src" "$_canon"; then
+					log "权威副本已同步为最新已安装版本: $_canon"
+				fi
+			fi
+			printf '%s' "$_canon"
+			return 0
+		fi
+	done
+
 	if script_is_c2 "$_canon"; then
 		printf '%s' "$_canon"
 		return 0
 	fi
-	_mkdir=$(dirname "$_canon")
-	[ -d "$_mkdir" ] || mkdir -p "$_mkdir" 2>/dev/null || return 1
 	log "SSD 权威副本缺失或已损坏，尝试重新下载"
 	if download_script "$_canon"; then
 		log "已重建权威副本: $_canon"
@@ -199,10 +242,8 @@ restore_shared_script() {
 
 	_canon=$(ensure_canonical) || return 1
 
-	cp -f "$_canon" $C2_GUARD_SCRIPT_PATH 2>/dev/null || return 1
-	chmod 0755 $C2_GUARD_SCRIPT_PATH 2>/dev/null
-	cp -f "$_canon" $C2_GUARD_ROOT_SCRIPT 2>/dev/null || return 1
-	chmod 0755 $C2_GUARD_ROOT_SCRIPT 2>/dev/null
+	atomic_install "$_canon" "$C2_GUARD_SCRIPT_PATH" || return 1
+	atomic_install "$_canon" "$C2_GUARD_ROOT_SCRIPT" || return 1
 	ln -sf "$C2_GUARD_SCRIPT_PATH" "$C2_GUARD_BIN_LINK" 2>/dev/null
 
 	if [ "$_granted" = "true" ]; then
@@ -414,6 +455,19 @@ show_status() {
 }
 
 # 校验并修复
+# 自愈：路径单元若因异常进入 failed 状态，把它重新拉起。
+# 没有它，一次密集触发就可能让守护彻底停摆。
+heal_path_unit() {
+	have_cmd systemctl || return 0
+	systemctl is-enabled c2-guard.path >/dev/null 2>&1 || return 0
+	systemctl is-active c2-guard.path >/dev/null 2>&1 && return 0
+	systemctl reset-failed c2-guard.path >/dev/null 2>&1
+	if systemctl start c2-guard.path >/dev/null 2>&1; then
+		log "已重新拉起 c2-guard.path"
+	fi
+	return 0
+}
+
 do_check() {
 	conf_load
 	if [ "$C2_ENABLED" != "true" ] || [ -z "$C2_STORAGE_ROOT" ]; then
@@ -425,6 +479,7 @@ do_check() {
 
 	# 1. 共享脚本
 	if ! script_is_c2 "$C2_GUARD_SCRIPT_PATH"; then
+		log "检测到共享脚本异常: $C2_GUARD_SCRIPT_PATH"
 		if restore_shared_script; then
 			log "共享脚本已被第三方覆盖，已恢复为 C2 版"
 			info "${GREEN}已恢复共享脚本为 C2 版${NC}"
@@ -434,7 +489,8 @@ do_check() {
 		fi
 	fi
 	if ! script_is_c2 "$C2_GUARD_ROOT_SCRIPT"; then
-		cp -f "$(canonical_path)" $C2_GUARD_ROOT_SCRIPT 2>/dev/null && chmod 0755 $C2_GUARD_ROOT_SCRIPT 2>/dev/null
+		log "检测到共享脚本异常: $C2_GUARD_ROOT_SCRIPT"
+		atomic_install "$(canonical_path)" "$C2_GUARD_ROOT_SCRIPT"
 	fi
 	if [ ! -L "$C2_GUARD_BIN_LINK" ] || [ "$(readlink "$C2_GUARD_BIN_LINK" 2>/dev/null)" != "$C2_GUARD_SCRIPT_PATH" ]; then
 		ln -sf "$C2_GUARD_SCRIPT_PATH" "$C2_GUARD_BIN_LINK" 2>/dev/null
@@ -472,6 +528,9 @@ do_check() {
 			systemctl restart docker.service >/dev/null 2>&1 && info "${GREEN}已重启 Docker 使新配置生效${NC}"
 		fi
 	fi
+
+	# 7. 自愈：确保路径监视单元还在工作
+	heal_path_unit
 	return 0
 }
 
@@ -482,18 +541,6 @@ do_check() {
 # 建立 SSD 上的权威副本（优先复制本机现有 C2 版脚本，其次下载）
 # 已存在时同样刷新，保证权威副本与当前安装版本一致
 seed_canonical() {
-	_canon=$(canonical_path)
-	_mkdir=$(dirname "$_canon")
-	[ -d "$_mkdir" ] || mkdir -p "$_mkdir" 2>/dev/null || return 1
-	for _src in "$C2_GUARD_SCRIPT_PATH" "$C2_GUARD_ROOT_SCRIPT"; do
-		if script_is_c2 "$_src"; then
-			cp -f "$_src" "$_canon" 2>/dev/null || continue
-			chmod 0755 "$_canon" 2>/dev/null
-			log "已用本机 C2 版脚本刷新权威副本: $_canon"
-			return 0
-		fi
-	done
-	# 本机没有可用副本时退回下载
 	ensure_canonical >/dev/null 2>&1
 }
 
@@ -509,6 +556,11 @@ Description=云存宝C2 定制守护
 After=network-online.target docker.service
 Wants=network-online.target
 ConditionPathExists=$C2_CONF_FILE
+# 关闭启动频率限制。
+# 脚本被反复改写（例如第三方应用循环覆盖）时，触发会非常密集；
+# 若沿用 systemd 默认的 5 次/10 秒限制，守护会被 start-limit-hit 锁死，
+# 之后再也不会自动恢复——这比不装守护还糟。
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -544,6 +596,8 @@ WantedBy=paths.target
 EOF
 
 	systemctl daemon-reload >/dev/null 2>&1
+	# 清掉历史失败状态，避免守护处于 locked 状态形同虚设
+	systemctl reset-failed c2-guard.service c2-guard.path >/dev/null 2>&1
 	systemctl enable --now c2-guard.timer >/dev/null 2>&1
 	systemctl enable --now c2-guard.path >/dev/null 2>&1
 	ok "已安装并启用 C2 守护（定时器 + 路径监视）"

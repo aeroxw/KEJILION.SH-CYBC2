@@ -219,7 +219,7 @@ fi
 
 # 设置恢复必须在安装之后执行，否则恢复结果会被 cp 覆盖
 restore_line=$(grep -n 'canshu_v6' "$script_path" | grep -v '()' | head -1 | cut -d: -f1)
-install_line=$(grep -n 'cp -f "\$c2_install_src" ~/' "$script_path" | head -1 | cut -d: -f1)
+install_line=$(grep -nE '(cp -f|c2_atomic_copy) "\$c2_install_src" ~/' "$script_path" | head -1 | cut -d: -f1)
 if [ -z "$restore_line" ] || [ -z "$install_line" ]; then
 	echo "cannot locate self-install / settings-restore blocks" >&2
 	exit 1

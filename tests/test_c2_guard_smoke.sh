@@ -204,13 +204,64 @@ script_is_c2 "$C2_GUARD_SCRIPT_PATH" || fail "do_check did not restore the share
 script_is_c2 "$C2_GUARD_ROOT_SCRIPT" || fail "do_check did not restore the root script"
 [ -L "$C2_GUARD_BIN_LINK" ] || fail "do_check did not restore the /usr/bin/k symlink"
 
-# --- 9. 权威副本缺失时尝试重建（下载地址不可达时应失败并保持原状）---------
+# --- 9. 权威副本：必须跟随「已安装的最新 C2 版脚本」-------------------------
+# 回归：权威副本曾经是静态旧快照，守护会用它把用户刚更新的脚本回滚成旧版
 cp "$sandbox/upstream.sh" "$sandbox/storage/c2/kejilion.sh"
 C2_SCRIPT_URLS="http://127.0.0.1:1/kejilion.sh"
+
+# 本机已安装的 C2 版脚本可以用来重建权威副本（断网也能恢复）
+if ! ensure_canonical >/dev/null 2>&1; then
+	fail "ensure_canonical must rebuild from the installed C2 script when the copy is corrupt"
+fi
+script_is_c2 "$sandbox/storage/c2/kejilion.sh" ||
+	fail "ensure_canonical did not refresh the canonical copy from the installed script"
+
+# 已安装版本更新后，权威副本必须跟着更新，不能停留在旧快照
+make_script "$C2_GUARD_SCRIPT_PATH" yes true
+echo '# C2_CANONICAL_V2' >>"$C2_GUARD_SCRIPT_PATH"
+ensure_canonical >/dev/null 2>&1
+grep -q 'C2_CANONICAL_V2' "$sandbox/storage/c2/kejilion.sh" ||
+	fail "canonical copy must follow the newest installed script"
+
+# 本机没有可用副本、且全部下载地址不可达时必须失败
+cp "$sandbox/upstream.sh" "$C2_GUARD_SCRIPT_PATH"
+cp "$sandbox/upstream.sh" "$C2_GUARD_ROOT_SCRIPT"
+cp "$sandbox/upstream.sh" "$sandbox/storage/c2/kejilion.sh"
 if ensure_canonical >/dev/null 2>&1; then
 	fail "ensure_canonical must fail when every download source is unreachable"
 fi
 script_is_c2 "$sandbox/storage/c2/kejilion.sh" &&
 	fail "broken canonical copy must not pass script_is_c2"
+
+# --- 10. 禁止原地覆盖正在执行的脚本 -----------------------------------------
+# cp 覆盖同一个 inode 会破坏同时运行的 k 进程（bash 按字节偏移续读，
+# 内容一变就报 "syntax error: unexpected EOF"）。必须走「临时文件 + rename」。
+main_script="${project_root}/kejilion.sh"
+if [ -f "$main_script" ]; then
+	if grep -qE 'cp -f +~/kejilion\.sh +/usr/local/bin/k([^a-zA-Z0-9_.-]|$)' "$main_script"; then
+		fail "kejilion.sh must not copy onto /usr/local/bin/k in place (breaks running k)"
+	fi
+	grep -q 'c2_atomic_copy()' "$main_script" ||
+		fail "kejilion.sh must provide c2_atomic_copy for self-install"
+	grep -q 'c2_atomic_copy ~/kejilion.sh /usr/local/bin/k' "$main_script" ||
+		fail "kejilion.sh must install to /usr/local/bin/k via c2_atomic_copy"
+fi
+if grep -qE 'cp -f +"\$_canon" +"?\$?C2_GUARD_SCRIPT_PATH' "$guard_path"; then
+	fail "c2_guard.sh must not restore the shared script in place (breaks running k)"
+fi
+grep -q 'atomic_install()' "$guard_path" ||
+	fail "c2_guard.sh must provide atomic_install for restoring the shared script"
+grep -q 'atomic_install "\$_canon" "\$C2_GUARD_SCRIPT_PATH"' "$guard_path" ||
+	fail "c2_guard.sh must restore the shared script via atomic_install"
+
+# --- 11. 守护不能被 systemd 启动频率限制锁死 -------------------------------
+# 脚本被反复改写时触发会非常密集，若沿用默认的 5 次/10 秒限制，
+# 守护会进入 start-limit-hit 状态并彻底停摆。
+grep -q 'StartLimitIntervalSec=0' "$guard_path" ||
+	fail "c2_guard.sh must disable the systemd start limit for the guard service"
+grep -q 'reset-failed c2-guard' "$guard_path" ||
+	fail "c2_guard.sh must reset failed unit state"
+grep -q 'heal_path_unit' "$guard_path" ||
+	fail "c2_guard.sh must self-heal a failed path unit"
 
 echo "c2_guard_smoke=pass"

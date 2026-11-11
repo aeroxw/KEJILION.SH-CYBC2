@@ -2569,6 +2569,93 @@ c2_revert() {
 	return 0
 }
 
+# C2: 本机主 IP（用于拼面板访问地址）
+c2_host_ip() {
+	local ip
+	ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+	[ -n "$ip" ] || ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
+	printf '%s' "$ip"
+}
+
+# C2: KPanel 面板对外端口（容器 kejilion-panel 映射的宿主机端口）
+c2_kpanel_port() {
+	docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null |
+		grep '^kejilion-panel|' |
+		grep -oE '[0-9]{2,5}->8080' | head -1 | sed 's/->.*//'
+}
+
+# C2: KPanel 初始化状态（required=未建账号 / ready=已建账号）
+c2_kpanel_bootstrap_state() {
+	local port="$1" out
+	[ -n "$port" ] || return 1
+	out=$(curl -fsS --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/api/v1/auth/bootstrap" 2>/dev/null)
+	case "$out" in
+		*'"required":true'*) printf 'required' ;;
+		*'"required":false'*) printf 'ready' ;;
+		*) return 1 ;;
+	esac
+}
+
+# C2: KPanel 面板状态速览
+c2_kpanel_status() {
+	local port state tok
+	if ! command -v docker >/dev/null 2>&1 ||
+		! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'kejilion-panel'; then
+		echo -e "KPanel 面板: ${gl_hui}未安装${gl_bai}"
+		return 0
+	fi
+	port=$(c2_kpanel_port)
+	echo -e "KPanel 面板: ${gl_lv}运行中${gl_bai}"
+	[ -n "$port" ] && echo "  访问地址: http://$(c2_host_ip):$port"
+	echo "  数据落点: $(readlink -f /home/docker/kpanel 2>/dev/null || echo '未知')"
+	state=$(c2_kpanel_bootstrap_state "$port")
+	case "$state" in
+		required) echo -e "  初始化: ${gl_huang}尚未创建管理员账户${gl_bai}" ;;
+		ready) echo -e "  初始化: ${gl_lv}已完成${gl_bai}" ;;
+		*) echo -e "  初始化: ${gl_hui}状态未知${gl_bai}" ;;
+	esac
+	tok="/home/docker/kpanel/data/panel/bootstrap.token"
+	if [ -f "$tok" ]; then
+		echo -e "  一次性凭据: ${gl_huang}已生成（用「k c2」选项 9 查看）${gl_bai}"
+	fi
+}
+
+# C2: 展示 KPanel 初始化凭据 / 登录与找回密码指引
+c2_kpanel_credentials() {
+	local port state tok
+	port=$(c2_kpanel_port)
+	if [ -z "$port" ]; then
+		echo -e "${gl_huang}未检测到运行中的 KPanel 面板${gl_bai}"
+		echo "安装命令：k app kpanel"
+		return 1
+	fi
+	state=$(c2_kpanel_bootstrap_state "$port")
+	tok="/home/docker/kpanel/data/panel/bootstrap.token"
+	if [ "$state" = "required" ] && [ -f "$tok" ]; then
+		echo -e "${gl_kjlan}初始化凭据（一次性，成功后立即失效）:${gl_bai}"
+		echo ""
+		cat "$tok" 2>/dev/null
+		echo ""
+		echo "打开 http://$(c2_host_ip):$port ，把上面这串粘进「初始化凭据」框，"
+		echo "再设置管理员用户名与密码即可。"
+		return 0
+	fi
+	if [ "$state" = "ready" ]; then
+		echo -e "${gl_kjlan}面板已完成初始化${gl_bai}"
+		echo "访问地址: http://$(c2_host_ip):$port"
+		echo ""
+		echo "忘记密码时，登录页点「忘记密码」，或用 root 在服务器上离线重置："
+		echo "  cd /home/docker/kpanel"
+		echo "  docker compose --env-file .env stop panel"
+		echo "  docker compose --env-file .env run --rm --no-deps panel reset-password"
+		echo "  docker compose --env-file .env up -d panel"
+		echo "（密码只能交互式输入两遍；多管理员加 --username <用户名>）"
+		return 0
+	fi
+	echo -e "${gl_huang}无法获取面板初始化状态，请确认容器与网络正常${gl_bai}"
+	return 1
+}
+
 # 显示当前存储状态
 c2_status() {
 	local root docker_target web_target data_target item
@@ -2607,6 +2694,7 @@ c2_status() {
 	else
 		echo -e "定制守护: ${gl_huang}未安装（KPanel 等应用安装后可能覆盖本脚本）${gl_bai}"
 	fi
+	c2_kpanel_status
 	echo "------------------------------------------------"
 }
 
@@ -2624,6 +2712,7 @@ c2_menu() {
 		echo -e "${gl_kjlan}6.   ${gl_bai}环境自检（系统 / 组件 / 磁盘）"
 		echo -e "${gl_kjlan}7.   ${gl_bai}补齐基础组件（bash/curl/jq 等）"
 		echo -e "${gl_kjlan}8.   ${gl_bai}安装 / 检查 C2 定制守护（防 KPanel 覆盖）"
+		echo -e "${gl_kjlan}9.   ${gl_bai}KPanel 初始化凭据 / 登录与找回密码"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
 		echo -e "${gl_kjlan}0.   ${gl_bai}返回上一级选单"
 		echo -e "${gl_kjlan}------------------------${gl_bai}"
@@ -2672,6 +2761,11 @@ c2_menu() {
 			8)
 				clear
 				c2_guard_menu
+				echo ""
+				;;
+			9)
+				clear
+				c2_kpanel_credentials
 				echo ""
 				;;
 			*)
@@ -2799,6 +2893,23 @@ c2_auto_select() {
 }
 
 
+# 原子复制：先写临时文件再 rename 覆盖目标。
+# 不能直接 cp 覆盖——正在运行该脚本的 shell 按字节偏移续读同一个 inode，
+# 内容一变就会读到错位片段，报 "syntax error: unexpected EOF"。
+# rename 只替换目录项，运行中的进程仍持有旧 inode，不受影响。
+c2_atomic_copy() {
+	local src="$1" dst="$2" tmp mode
+	[ -n "$src" ] && [ -n "$dst" ] || return 1
+	[ -f "$src" ] || return 1
+	tmp="${dst}.c2install.$$"
+	cp -f "$src" "$tmp" > /dev/null 2>&1 || { rm -f "$tmp" > /dev/null 2>&1; return 1; }
+	mode=$(stat -c '%a' "$src" 2>/dev/null || echo 755)
+	chmod "$mode" "$tmp" > /dev/null 2>&1
+	mv -f "$tmp" "$dst" > /dev/null 2>&1 || { rm -f "$tmp" > /dev/null 2>&1; return 1; }
+	return 0
+}
+
+
 if ! kpanel_protocol_active; then
 	c2_conf_load
 
@@ -2827,7 +2938,7 @@ if ! kpanel_protocol_active; then
 			;;
 	esac
 	if [ -n "$c2_install_src" ]; then
-		cp -f "$c2_install_src" ~/kejilion.sh > /dev/null 2>&1
+		c2_atomic_copy "$c2_install_src" ~/kejilion.sh
 	fi
 
 	# 设置恢复必须在安装之后执行：
@@ -2836,7 +2947,9 @@ if ! kpanel_protocol_active; then
 	CheckFirstRun_true
 	yinsiyuanquan2
 
-	cp -f ~/kejilion.sh /usr/local/bin/k > /dev/null 2>&1
+	# 原子安装：不能原地覆盖 /usr/local/bin/k，
+	# 否则脚本运行期间会把自己写坏（本文件正是从这里执行的）
+	c2_atomic_copy ~/kejilion.sh /usr/local/bin/k
 	ln -sf /usr/local/bin/k /usr/bin/k > /dev/null 2>&1
 fi
 
@@ -37721,7 +37834,8 @@ while true; do
 				canshu_v6
 				CheckFirstRun_true
 				yinsiyuanquan2
-				cp -f ~/kejilion.sh /usr/local/bin/k > /dev/null 2>&1
+				# 原子替换：不能原地覆盖正在被执行的 /usr/local/bin/k
+				c2_atomic_copy ~/kejilion.sh /usr/local/bin/k
 				ln -sf /usr/local/bin/k /usr/bin/k > /dev/null 2>&1
 				echo -e "${gl_lv}脚本已更新到最新版本！${gl_huang}v$sh_v_new${gl_bai}"
 				send_stats "脚本已经最新$sh_v_new"
@@ -37763,7 +37877,9 @@ while true; do
 			# 从旧脚本恢复 permission_granted 和 ENABLE_STATS 设置
 			SH_Update_task="$SH_Update_task && grep -q 'permission_granted=\"true\"' ~/kejilion.sh.bak 2>/dev/null && sed -i 's/permission_granted=\"false\"/permission_granted=\"true\"/' ~/kejilion.sh; grep -q 'ENABLE_STATS=\"false\"' ~/kejilion.sh.bak 2>/dev/null && sed -i 's/ENABLE_STATS=\"true\"/ENABLE_STATS=\"false\"/' ~/kejilion.sh"
 			# 部署到 /usr/local/bin/k 和 /usr/bin/k
-			SH_Update_task="$SH_Update_task; cp -f ~/kejilion.sh /usr/local/bin/k 2>/dev/null; ln -sf /usr/local/bin/k /usr/bin/k 2>/dev/null"
+			# 必须用「临时文件 + rename」而不是直接 cp 覆盖：
+			# 原地覆盖会破坏同一时刻正在运行的 k 进程（读取偏移错位）
+			SH_Update_task="$SH_Update_task; cp -f ~/kejilion.sh /usr/local/bin/k.c2tmp 2>/dev/null && chmod 0755 /usr/local/bin/k.c2tmp 2>/dev/null && mv -f /usr/local/bin/k.c2tmp /usr/local/bin/k 2>/dev/null; ln -sf /usr/local/bin/k /usr/bin/k 2>/dev/null"
 			# 下载失败时清理临时文件
 			SH_Update_task="$SH_Update_task || rm -f \"\$tmp\" 2>/dev/null"
 
@@ -38308,6 +38424,10 @@ else
 
 		c2status)
 			c2_status
+			;;
+
+		kpanelcred)
+			c2_kpanel_credentials
 			;;
 
 		fail2ban|f2b)
