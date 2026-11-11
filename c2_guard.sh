@@ -17,11 +17,18 @@
 #     5. 存储挂载：存储根未挂载时告警
 #     6. KPanel：集群私网 CIDR 白名单必须保留，否则「集群 → 添加主机」被拒
 #
+#   KPanel 白名单只补 .env、不自动重建容器：
+#     --force-recreate 会打断面板与宿主机 Agent 的 Unix Socket 会话，
+#     更重要的是 KPanel 重建时会重写 .env 抹掉该键，导致守护每轮都
+#     「修复 → 重建 → 被抹掉」，形成稳定死循环并反复打断在线页面。
+#     需要立即生效时由人显式执行 `c2-guard kpanel-reload`。
+#
 # 用法：
 #   sh c2_guard.sh check              # 校验并修复（守护默认动作）
 #   sh c2_guard.sh status            # 只读体检，不做任何修改
 #   sh c2_guard.sh install           # 安装 systemd 定时器 + 路径监视并启用
 #   sh c2_guard.sh uninstall         # 停用并移除 systemd 单元
+#   sh c2_guard.sh kpanel-reload     # 重建 KPanel 容器使白名单立即生效（会中断面板）
 #
 # 环境变量（测试用）：
 #   C2_CONF_FILE      配置文件路径，默认 /etc/kejilion/c2.conf
@@ -357,7 +364,8 @@ repair_kpanel_env() {
 	return 10
 }
 
-# 重建 KPanel 容器，让白名单环境变量真正生效
+# 重建 KPanel 容器，让白名单环境变量真正生效。
+# 仅供 kpanel_reload 显式调用；自动守护路径不得使用。
 recreate_kpanel() {
 	_env="${C2_GUARD_KPANEL_ENV:-/home/docker/kpanel/.env}"
 	_dir=$(dirname "$_env")
@@ -366,6 +374,22 @@ recreate_kpanel() {
 	docker ps -a --filter 'name=^/kejilion-panel$' --format '{{.Names}}' 2>/dev/null |
 		grep -q '^kejilion-panel$' || return 1
 	( cd "$_dir" && docker compose --env-file .env up -d --force-recreate ) >/dev/null 2>&1 || return 1
+	return 0
+}
+
+# 显式重建 KPanel 容器，让 .env 里的白名单真正生效。
+# 只能由人手动调用（c2-guard kpanel-reload）：
+# 重建会短暂打断面板与宿主机 Agent 的连接，浏览器页面需要刷新。
+# 自动守护路径严禁调用本函数，否则会形成「重建抹掉 .env → 再修 → 再重建」死循环。
+kpanel_reload() {
+	_env="${C2_GUARD_KPANEL_ENV:-/home/docker/kpanel/.env}"
+	_cidrs="${C2_KPANEL_PRIVATE_CIDRS:-}"
+	[ -n "$_cidrs" ] || { err "未配置 C2_KPANEL_PRIVATE_CIDRS，无需重建"; return 1; }
+	# 先确保 .env 是正确值，避免重建后又被抹掉
+	repair_kpanel_env >/dev/null 2>&1
+	recreate_kpanel || { err "KPanel 容器重建失败，请检查 docker compose 状态"; return 1; }
+	ok "${GREEN}已重建 KPanel 容器，CIDR 白名单已生效；请刷新浏览器页面${NC}"
+	log "手动重建 KPanel 容器使 CIDR 白名单生效"
 	return 0
 }
 
@@ -575,15 +599,15 @@ do_check() {
 	check_symlink "$C2_GUARD_HOME_WEB" "${C2_STORAGE_ROOT%/}/web"
 
 	# 5. KPanel 集群私网白名单
+	#    只修 .env，绝不自动重建面板容器。
+	#    --force-recreate 会打断面板与宿主机 Agent 的 Unix Socket 会话，
+	#    浏览器随即报「宿主机 Agent 已离线 / 无法读取服务端界面状态」；
+	#    更糟的是 KPanel 重建时会重写 .env 抹掉白名单，于是每次守护都会
+	#    再修一次、再重建一次，形成稳定死循环。
+	#    需要让新值生效时，由人显式执行 `c2-guard kpanel-reload`。
 	repair_kpanel_env
-	_rc=$?
-	if [ "$_rc" -eq 10 ]; then
-		if recreate_kpanel; then
-			info "${GREEN}已重建 KPanel 容器使 CIDR 白名单生效${NC}"
-		else
-			warn "KPanel 容器重建失败，白名单将在下次守护时重试"
-			log "KPanel 容器重建失败"
-		fi
+	if [ "$?" -eq 10 ]; then
+		info "已修复 KPanel 集群私网 CIDR 白名单，下次面板重启时生效（如需立即生效：c2-guard kpanel-reload）"
 	fi
 
 	# 6. 挂载
@@ -696,6 +720,8 @@ usage() {
   sh c2_guard.sh status      只读体检，不做任何修改
   sh c2_guard.sh install     安装 systemd 定时器与路径监视并启用
   sh c2_guard.sh uninstall   停用并移除 systemd 单元
+  sh c2_guard.sh kpanel-reload  重建 KPanel 容器使 CIDR 白名单立即生效
+                             （会短暂中断面板，执行后需刷新浏览器）
 EOF
 }
 
@@ -706,6 +732,7 @@ main() {
 		status) show_status ;;
 		install) install_units ;;
 		uninstall) uninstall_units ;;
+		kpanel-reload) kpanel_reload ;;
 		-h|--help|help) usage ;;
 		*)
 			err "未知命令: $_cmd"

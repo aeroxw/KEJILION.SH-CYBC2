@@ -314,4 +314,21 @@ do_check || fail "do_check returned non-zero"
 grep -q '^KPANEL_CLUSTER_PRIVATE_CIDRS=10.31.3.0/24$' "$C2_GUARD_KPANEL_ENV" ||
 	fail "do_check did not restore the KPanel cluster private CIDR whitelist"
 
+# --- 13. do_check 绝不自动重建 KPanel 容器 ----------------------------------
+# 回归：曾经在修复白名单后自动 --force-recreate。这会打断面板与宿主机
+# Agent 的 Unix Socket 会话（浏览器报「宿主机 Agent 已离线」/「无法读取
+# 服务端界面状态」），更糟的是 KPanel 重建时会重写 .env 抹掉白名单，
+# 于是守护每轮都「修复 → 重建 → 被抹掉」，形成稳定死循环、反复掉线。
+# 重建只能由人显式执行 kpanel-reload。
+_reload_flag="$sandbox/kpanel/reload-called"
+recreate_kpanel() { : > "$_reload_flag"; return 0; }
+sed -i '/^KPANEL_CLUSTER_PRIVATE_CIDRS=/d' "$C2_GUARD_KPANEL_ENV"
+do_check || fail "do_check returned non-zero"
+[ ! -e "$_reload_flag" ] ||
+	fail "do_check must never auto-recreate the KPanel container"
+grep -q 'kpanel-reload) kpanel_reload ;;' "$guard_path" ||
+	fail "c2_guard.sh must expose an explicit kpanel-reload command"
+grep -q 'repair_kpanel_env >/dev/null 2>&1' "$guard_path" ||
+	fail "kpanel_reload must repair .env before recreating the container"
+
 echo "c2_guard_smoke=pass"
