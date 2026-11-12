@@ -394,6 +394,43 @@ kpanel_reload() {
 }
 
 # ---------------------------------------------------------------------------
+# iptables 后端（C2 厂商内核 5.10.107 不支持 nftables netlink）
+# ---------------------------------------------------------------------------
+# 刷机或 iptables 包更新会把 update-alternatives 重置回 auto(nft)，
+# dockerd 随即无法创建 NAT 链而启动失败：
+#   iptables v1.8.10 (nf_tables): Could not fetch rule set generation id
+# 只切后端 + 装开机自愈，绝不主动重启 docker（重启会打断面板会话）。
+install_iptables_dropin() {
+	_dir="$C2_GUARD_UNIT_DIR/docker.service.d"
+	mkdir -p "$_dir" 2>/dev/null || return 1
+	cat > "$_dir/10-c2-iptables-legacy.conf" <<'EOF'
+[Service]
+ExecStartPre=/usr/bin/update-alternatives --set iptables /usr/sbin/iptables-legacy
+ExecStartPre=/usr/bin/update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+EOF
+	return 0
+}
+
+repair_iptables_backend() {
+	have_cmd update-alternatives || return 0
+	[ -x /usr/sbin/iptables-legacy ] || return 0
+	[ -x /usr/sbin/ip6tables-legacy ] || return 0
+	_changed=0
+	if iptables --version 2>/dev/null | grep -q 'nf_tables'; then
+		update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1 && _changed=1
+	fi
+	if ip6tables --version 2>/dev/null | grep -q 'nf_tables'; then
+		update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null 2>&1 && _changed=1
+	fi
+	if [ "$_changed" = "1" ]; then
+		info "${GREEN}已将 iptables 切换到 legacy 后端${NC}"
+		log "修复 iptables 后端为 legacy"
+	fi
+	install_iptables_dropin
+	return 0
+}
+
+# ---------------------------------------------------------------------------
 # 目录软链
 # ---------------------------------------------------------------------------
 
@@ -560,6 +597,9 @@ do_check() {
 
 	_need_restart=0
 
+	# iptables 后端：C2 内核不支持 nftables，刷机/包更新后常被重置回 nft
+	repair_iptables_backend
+
 	# 1. 共享脚本
 	if ! script_is_c2 "$C2_GUARD_SCRIPT_PATH"; then
 		log "检测到共享脚本异常: $C2_GUARD_SCRIPT_PATH"
@@ -690,6 +730,7 @@ Unit=c2-guard.service
 WantedBy=paths.target
 EOF
 
+	install_iptables_dropin || true
 	systemctl daemon-reload >/dev/null 2>&1
 	# 清掉历史失败状态，避免守护处于 locked 状态形同虚设
 	systemctl reset-failed c2-guard.service c2-guard.path >/dev/null 2>&1

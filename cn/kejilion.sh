@@ -2450,8 +2450,40 @@ c2_backup_root() {
 }
 
 # 一键把软件安装到 SSD
+# 云存宝 C2 厂商内核 5.10.107 不支持 nftables netlink，iptables 走 nft 后端时
+# dockerd 建不了 NAT 链（Could not fetch rule set generation id: Invalid argument）。
+# 刷机或 iptables 包更新会把 update-alternatives 重置回 auto(nft)，所以这里同时：
+#   1. 立即切回 legacy 后端
+#   2. 给 docker.service 装 ExecStartPre，保证每次启动前自动切回
+c2_ensure_iptables_legacy() {
+	command -v update-alternatives >/dev/null 2>&1 || return 0
+	[ -x /usr/sbin/iptables-legacy ] || return 0
+	[ -x /usr/sbin/ip6tables-legacy ] || return 0
+	local changed=0
+	if iptables --version 2>/dev/null | grep -q 'nf_tables'; then
+		update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1 && changed=1
+	fi
+	if ip6tables --version 2>/dev/null | grep -q 'nf_tables'; then
+		update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null 2>&1 && changed=1
+	fi
+	[ "$changed" = "1" ] && echo "已将 iptables 切换到 legacy 后端（C2 内核不支持 nftables）"
+	if command -v systemctl >/dev/null 2>&1; then
+		local dropin_dir="/etc/systemd/system/docker.service.d"
+		if mkdir -p "$dropin_dir" 2>/dev/null; then
+			cat > "$dropin_dir/10-c2-iptables-legacy.conf" <<'C2IPTABLES'
+[Service]
+ExecStartPre=/usr/bin/update-alternatives --set iptables /usr/sbin/iptables-legacy
+ExecStartPre=/usr/bin/update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+C2IPTABLES
+			systemctl daemon-reload >/dev/null 2>&1
+		fi
+	fi
+	return 0
+}
+
 c2_apply() {
 	local root="${1:-}" docker_target web_target data_target containerd_target was_running=0
+	c2_ensure_iptables_legacy
 	[ -n "$root" ] || return 1
 	root="${root%/}"
 	case "$root" in

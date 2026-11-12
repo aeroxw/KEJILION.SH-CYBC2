@@ -331,4 +331,27 @@ grep -q 'kpanel-reload) kpanel_reload ;;' "$guard_path" ||
 grep -q 'repair_kpanel_env >/dev/null 2>&1' "$guard_path" ||
 	fail "kpanel_reload must repair .env before recreating the container"
 
+# --- 14. iptables legacy 后端自愈 --------------------------------------------
+# 回归：C2 厂商内核 5.10.107 不支持 nftables netlink。刷机或 iptables 包更新
+# 会把 update-alternatives 重置回 auto(nft)，dockerd 建不了 DOCKER NAT 链，
+# 装应用时报「启动 docker 服务失败 / 安装失败: 未登记应用状态」。
+_dropin="$C2_GUARD_UNIT_DIR/docker.service.d/10-c2-iptables-legacy.conf"
+install_iptables_dropin || fail "install_iptables_dropin returned non-zero"
+[ -f "$_dropin" ] || fail "docker.service iptables drop-in was not installed"
+grep -q '^ExecStartPre=.*iptables-legacy' "$_dropin" ||
+	fail "drop-in must force iptables-legacy before dockerd starts"
+grep -q '^ExecStartPre=.*ip6tables-legacy' "$_dropin" ||
+	fail "drop-in must force ip6tables-legacy before dockerd starts"
+grep -q 'repair_iptables_backend' "$guard_path" ||
+	fail "c2_guard.sh must run repair_iptables_backend inside do_check"
+grep -q 'install_iptables_dropin' "$guard_path" ||
+	fail "c2_guard.sh must install the drop-in from install_units"
+
+# 主脚本 k c2 路径也必须切后端，否则刷机后第一次装应用就会失败
+_repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+grep -q 'c2_ensure_iptables_legacy' "$_repo_root/kejilion.sh" ||
+	fail "kejilion.sh must fix the iptables backend from c2_apply"
+grep -q 'c2_ensure_iptables_legacy' "$_repo_root/cn/kejilion.sh" ||
+	fail "cn/kejilion.sh must stay in sync for the iptables fix"
+
 echo "c2_guard_smoke=pass"
